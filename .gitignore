@@ -441,3 +441,5 @@ FodyWeavers.xsd
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+CrystalBallAPI/ModelnProc/data/*
