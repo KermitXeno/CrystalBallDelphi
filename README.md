@@ -3,4 +3,4 @@ This is an active project that will eventually be an automated stock/crypto trad
 currently the planned tech stack will be:
 - PHP (frontend)
 - React(frontend)
-- Python(backend (api, models))
+- Python(backend (api(flask), models(tensorflow))
