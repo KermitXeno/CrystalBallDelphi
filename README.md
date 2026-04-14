@@ -3,4 +3,6 @@ This is an active project that will eventually be an automated stock/crypto trad
 currently the planned tech stack will be:
 - PHP (frontend)
 - React(frontend)
-- Python(backend (api(flask), models(tensorflow))
+- Python(backend (api(flask), models(Pytorch))
+
+As of now we are using a sliding temporal graph and cascading outputs from the regime model to the posion model for the purpose of composing trades.
