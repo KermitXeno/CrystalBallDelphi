@@ -4,7 +4,7 @@ TRANSITION_LOOKAHEAD_15M = 16
 TRANSITION_PERSISTENCE_15M = 32
 TRANSITION_MIN_AGREEMENT = 0.75
 
-
+# For each timestep, label as transition if at least TRANSITION_MIN_AGREEMENT fraction of the next
 def _persistent_transition_labels(regime_argmax, n_classes):
     windows = [regime_argmax.shift(-i) for i in range(TRANSITION_LOOKAHEAD_15M,
                                                       TRANSITION_LOOKAHEAD_15M + TRANSITION_PERSISTENCE_15M)]
@@ -21,7 +21,7 @@ def _persistent_transition_labels(regime_argmax, n_classes):
     transition[invalid_rows.values] = np.nan
     return transition
 
-
+# For a given horizon, compute indicators with lookback equal to the horizon length, sample at block offsets, and aggregate by mean and slope
 def _features_for_horizon(px_15m, h_name):
     h_bars = HORIZON_BARS_15M[h_name]
     lookback = h_bars
@@ -34,7 +34,7 @@ def _features_for_horizon(px_15m, h_name):
         aggregated_norm[f"{h_name}_{name}"] = normalise(df, window = norm_window)
     return aggregated_norm
 
-
+# Compute the PEF derivative at 1h cadence, then forward-fill to 15m. This captures the regime change signal at the 1h level while providing a smoothly updated feature at 15m.
 def _compute_pef_deriv_1h(px_15m):
     c = px_15m["close"]
     r_15m = np.log(c / c.shift(1)).ffill().fillna(0)
@@ -46,7 +46,7 @@ def _compute_pef_deriv_1h(px_15m):
     pe_deriv_15m = pe_deriv_s.reindex(c.index, method = "ffill").fillna(0)
     return pe_deriv_15m
 
-
+# Compute a set of global features at 15m cadence, including breadth, return dispersion, volatility regime, and the PEF derivative sampled at 1h cadence and forward-filled to 15m.
 def _global_features_15m(px_15m):
     c = px_15m["close"]
     r = np.log(c / c.shift(1))
@@ -73,7 +73,8 @@ def _global_features_15m(px_15m):
         "pef_deriv": pef_deriv,
     }), window = 256)
 
-
+# Compute a set of raw features for BTC at 15m cadence, including EMA slope, ADX, and realized volatility relative to its historical median. 
+# These features are not sampled at block offsets and are intended to provide a rich signal about BTC's current state that may be predictive of regime changes.
 def _btc_raw_features_15m(px_15m):
     c = px_15m["close"]
     h = px_15m["high"]
@@ -95,7 +96,8 @@ def _btc_raw_features_15m(px_15m):
         "btc_rv_vs_q50": (btc_rv / (btc_rv_q50 + 1e-9)).clip(0, 5).fillna(1.0),
     }, index = c.index)
 
-
+# Main function to process the model1 dataset. It computes node features for multiple horizons, global features, BTC-specific raw features, 
+# regime scores, and transition labels. It then identifies valid timesteps where all features are available and saves the processed dataset to a compressed NPZ file.
 def process_model1(px_15m):
     print("Building model1 dataset (15m cadence, multi-horizon blocks)...")
     c = px_15m["close"]

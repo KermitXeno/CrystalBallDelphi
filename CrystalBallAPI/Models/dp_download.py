@@ -44,7 +44,7 @@ FLOAT_COLS = [
     "open", "high", "low", "close", "volume",
     "quote_asset_volume", "taker_buy_base_volume", "taker_buy_quote_volume",
 ]
-
+#prevent api timeouts
 class RateLimiter:
     def __init__(self, calls_per_second):
         self._interval = 1.0 / calls_per_second
@@ -61,7 +61,7 @@ class RateLimiter:
  
 _limiter = RateLimiter(RATE_LIMIT)
  
- 
+# Determine where to resume based on existing data
 def resume_ts(path, interval, step_ms):
     if not os.path.exists(path):
         return START_MS
@@ -71,7 +71,7 @@ def resume_ts(path, interval, step_ms):
         return START_MS
     return int(sub["open_time"].max().timestamp() * 1000) + step_ms
  
- 
+# Fetch klines with retry and rate limit handling 
 def fetch_klines(symbol, interval, start_ts):
     retries = 0
     while retries < MAX_RETRIES:
@@ -100,7 +100,7 @@ def fetch_klines(symbol, interval, start_ts):
         return resp.json()
     return None
  
- 
+ # Convert raw rows to DataFrame with proper types and interval column
 def rows_to_df(rows, interval):
     df = pd.DataFrame(rows, columns = COLUMNS).drop(columns = ["ignore"])
     df.insert(0, "interval", interval)
@@ -110,7 +110,7 @@ def rows_to_df(rows, interval):
     df["num_trades"] = df["num_trades"].astype(int)
     return df
  
- 
+ # Merge new data with existing, remove duplicates, sort, and save
 def flush(path, df_new):
     if os.path.exists(path):
         df = pd.concat([pd.read_parquet(path), df_new], ignore_index = True)
@@ -123,7 +123,7 @@ def flush(path, df_new):
     df.to_parquet(path, index = False)
     return len(df)
  
- 
+ # Download data for a specific symbol and interval, handling batching and yearly flushes
 def download_interval(symbol, path, interval, step_ms):
     ts = resume_ts(path, interval, step_ms)
     if ts >= END_MS:
@@ -160,13 +160,13 @@ def download_interval(symbol, path, interval, step_ms):
  
     print(f"{symbol} {interval} done total {total}")
  
- 
+ # Download data for all intervals of a symbol
 def download_symbol(symbol):
     path = os.path.join(BASE_DIR, f"{symbol}.parquet")
     for interval, step_ms in INTERVALS.items():
         download_interval(symbol, path, interval, step_ms)
  
- 
+ # Use ThreadPoolExecutor to download multiple symbols in parallel, handling exceptions
 def main():
     with ThreadPoolExecutor(max_workers = len(SYMBOLS)) as executor:
         task_map = {executor.submit(download_symbol, s): s for s in SYMBOLS}

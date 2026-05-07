@@ -15,7 +15,7 @@ BTC_IDX = ASSETS.index("BTCUSDT")
 
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-
+# Dataset classes for the regime prediction (model 1) and multi-horizon return prediction (model 2) tasks.
 class Model1Dataset(Dataset):
     def __init__(self, npz_path, window = 672, assets = ASSETS):
         self.window = window
@@ -109,7 +109,7 @@ class Model1Dataset(Dataset):
             drop_last = False,
         )
 
-
+# Model2Dataset provides sequences of features and targets for multi-horizon return prediction, with support for multiple timeframes and model 1 outputs.
 class Model2Dataset(Dataset):
     def __init__(self, npz_path, seq_len_1h = 72, seq_k = 8, split = "train", train_frac = 0.70, val_frac = 0.15, stride = 1, lookback_15m = 96, lookback_30m = 48, assets = ASSETS, bar_range = None):
         self.seq_len_1h = seq_len_1h
@@ -223,7 +223,7 @@ class Model2Dataset(Dataset):
         self.sentiment_scores = scores.astype(np.float32)
         self.sentiment_missing = missing.astype(np.float32)
 
-
+# Utility function to update model 1 outputs in the model 2 dataset, allowing for iterative improvements to the regime prediction component without needing to regenerate all features and targets.
 def set_model1_outputs(npz_path, m1_outputs):
     d = dict(np.load(npz_path))
     expected_shape = d["model1_outputs"].shape

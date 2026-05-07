@@ -14,7 +14,8 @@ from model1_layers import (
 )
 from ds_struc_wstg import Model1Dataset, BASE_DIR
 
-
+# Default configuration for Model1. This can be overridden by passing a dict to the Model1 constructor or the train function.
+#all strides must be odd
 DEFAULT_CFG = {
     "N": 20,
     "F_node": 104,
@@ -67,7 +68,9 @@ DEFAULT_CFG = {
     "feature_noise_std": 0.03,
 }
 
-
+# Model1 is a multi-input architecture that processes temporal asset features, learnable graph representations, and optional sentiment scores to predict market regimes and transitions. 
+# It uses gated fusion to combine temporal and graph information, and has auxiliary heads for trending and ADX predictions. The training loop includes data augmentation, mixed precision, 
+# learning rate scheduling, and early stopping based on validation F1 score.
 class Model1(nn.Module):
 
     def __init__(self, cfg = None):
@@ -217,7 +220,8 @@ class Model1(nn.Module):
 
         return regime_logits, transition_logit, fused, aux
 
-
+# Model1Loss combines cross-entropy loss for regime classification, binary cross-entropy for transition prediction, and optional auxiliary losses for trending and ADX predictions. 
+# It also incorporates KL divergence regularization between predicted regime scores and provided regime scores, weighted by a configurable factor.
 class Model1Loss(nn.Module):
 
     def __init__(self, class_weights, transition_pos_weight,
@@ -249,7 +253,7 @@ class Model1Loss(nn.Module):
                     aux["adx_pred"], adx_target)
         return total, r_loss.detach(), t_loss.detach()
 
-
+# compute_class_weights calculates inverse frequency weights for each class in the dataset to address class imbalance. It can use either regime_scores or regime_labels from the dataset to determine class frequencies
 def compute_class_weights(dataset, n_classes = 3, power = 1.0):
     if hasattr(dataset, "regime_scores"):
         labels = dataset.regime_scores.argmax(axis = 1).astype(np.int64)
@@ -262,7 +266,7 @@ def compute_class_weights(dataset, n_classes = 3, power = 1.0):
     weights = raw / raw.sum() * n_classes
     return torch.from_numpy(weights)
 
-
+# compute_transition_pos_weight calculates the positive class weight for the transition prediction loss based on the ratio of negative to positive samples in the dataset. It caps the weight at a specified maximum to prevent excessively large values.
 def compute_transition_pos_weight(dataset, cap = 4.0):
     labels = dataset.transition_labels
     n_pos = float((labels == 1).sum())
@@ -270,7 +274,9 @@ def compute_transition_pos_weight(dataset, cap = 4.0):
     pos_weight = min(n_neg / max(n_pos, 1.0), cap)
     return torch.tensor([pos_weight])
 
-
+# augment_batch applies data augmentation techniques to the input batch during training. It can perform temporal masking by randomly zeroing out 
+# contiguous blocks of time steps, feature masking by randomly zeroing out individual features, and adding Gaussian noise to the features. The probabilities and parameters 
+# for these augmentations are configurable through the cfg dictionary.
 def augment_batch(batch, cfg):
     node = batch["node_features"]
     glob = batch["global_features"]
@@ -314,11 +320,12 @@ def augment_batch(batch, cfg):
     batch["time_enc"] = tenc
     return batch
 
-
+#_ to_device moves all tensors in the batch dictionary to the specified device (CPU or GPU) with non-blocking transfers for improved performance during training and evaluation.
 def _to_device(batch, device):
     return {k: v.to(device, non_blocking = True) for k, v in batch.items()}
 
-
+# _compute_metrics calculates evaluation metrics for the regime classification and transition prediction tasks. It computes overall accuracy, macro F1 score 
+# for regime classification, F1 score per class, and recall for transition prediction based on a binary threshold of 0.5.
 def _compute_metrics(regime_pred, regime_true, trans_pred, trans_true, n_classes = 3):
     acc = float((regime_pred == regime_true).mean())
 
@@ -344,7 +351,10 @@ def _compute_metrics(regime_pred, regime_true, trans_pred, trans_true, n_classes
         "trans_recall": trans_recall,
     }
 
-
+# train_epoch performs one epoch of training for the Model1 architecture. It iterates over the training data loader, applies data augmentation, 
+# computes the loss using the Model1Loss function, and updates the model parameters using backpropagation and an optimizer. It also supports mixed
+# precision training with a GradScaler and can update an exponential moving average (EMA) of the model parameters if provided. The function returns the average loss 
+# for the epoch as well as separate losses for regime classification and transition prediction.
 def train_epoch(model, loader, optimizer, loss_fn, scaler, device, grad_clip,
                 cfg = None, ema = None):
     model.train()
@@ -401,7 +411,8 @@ def train_epoch(model, loader, optimizer, loss_fn, scaler, device, grad_clip,
 
     return total_loss / n, total_r / n, total_t / n
 
-
+# eval_epoch evaluates the model on a validation or test dataset. It iterates over the data loader without computing gradients, collects predictions and true labels, 
+# and computes the average loss and evaluation metrics such as accuracy and F1 score for regime classification, as well as recall for transition prediction.
 @torch.no_grad()
 def eval_epoch(model, loader, loss_fn, device):
     model.eval()
@@ -439,7 +450,8 @@ def eval_epoch(model, loader, loss_fn, device):
     )
     return total_loss / n, total_r / n, total_t / n, metrics
 
-
+# save_checkpoint saves the model state, optimizer state, scheduler state, current epoch, best validation loss, and optionally the 
+# EMA model state to a specified file path. This allows for resuming training or loading the best model for evaluation later.
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, ema = None):
     state = {
         "cfg": model.cfg,
@@ -453,14 +465,17 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, ema
         state["ema"] = ema.state_dict()
     torch.save(state, path)
 
-
+# load_checkpoint loads the model state, optimizer state, scheduler state, current epoch, best validation loss, and optionally the EMA model state from a 
+# specified file path. It returns the loaded model and the checkpoint dictionary for further use.
 def load_checkpoint(path, device = "cpu"):
     ckpt = torch.load(path, map_location = device)
     model = Model1(ckpt["cfg"]).to(device)
     model.load_state_dict(ckpt["model"])
     return model, ckpt
 
-
+# train is the main function that sets up the training environment for Model1. It loads the dataset, creates data loaders for training, validation, and testing, 
+# computes class weights for imbalanced loss, initializes the model and optimizer, and defines the learning rate scheduler. It then runs the training loop for a 
+# specified number of epochs, evaluating on the validation set after each epoch and saving checkpoints when performance improves.
 def train(cfg = None):
     cfg = {**DEFAULT_CFG, **(cfg or {})}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

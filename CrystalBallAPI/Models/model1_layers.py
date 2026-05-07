@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+# Gated Residual Network (GRN) with optional context
 class GRN(nn.Module):
 
     def __init__(self, d_in, d_out, d_ctx = None, dropout = 0.1):
@@ -21,7 +21,7 @@ class GRN(nn.Module):
         act = F.elu(self.fc_hidden(h))
         return self.norm(self.proj_skip(x) + self.drop(gate * act))
 
-
+# Causal 1D convolution for temporal processing, ensuring no future information is used
 class CausalConv1d(nn.Module):
 
     def __init__(self, d_in, d_out, kernel_size, dilation = 1):
@@ -33,7 +33,7 @@ class CausalConv1d(nn.Module):
         x = F.pad(x, (self.pad, 0))
         return self.conv(x)
 
-
+# Functional time encoding using learnable frequencies and phases, similar to Fourier features
 class FunctionalTimeEncoding(nn.Module):
 
     def __init__(self, d_embed, init_scale = 0.1):
@@ -48,7 +48,7 @@ class FunctionalTimeEncoding(nn.Module):
         x = t.unsqueeze(-1) * self.freqs + self.phase
         return torch.cat([x.cos(), x.sin()], dim = -1) * self.scale
 
-
+# Edge bias network to compute attention biases from edge features, with optional dropout for regularization
 class EdgeBiasNet(nn.Module):
 
     def __init__(self, F_edge, n_heads):
@@ -61,7 +61,7 @@ class EdgeBiasNet(nn.Module):
         bias = self.net(edge_features)
         return bias.permute(0, 3, 1, 2)
 
-
+# Stochastic depth module for regularization, randomly dropping entire layers during training with a specified probability
 class StochasticDepth(nn.Module):
 
     def __init__(self, drop_prob = 0.1):
@@ -76,7 +76,7 @@ class StochasticDepth(nn.Module):
         mask = torch.bernoulli(torch.full(shape, keep, device = x.device))
         return x * mask / keep
 
-
+# Multi-head attention mechanism that incorporates edge features as biases, allowing for dynamic attention based on graph structure and temporal context
 class GrangerAttention(nn.Module):
 
     def __init__(self, d_in, d_out, n_heads = 4, F_edge = 4,
@@ -113,7 +113,7 @@ class GrangerAttention(nn.Module):
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, N, -1)
         return self.W_o(out)
 
-
+# Graph encoder that processes node features with temporal convolutions and multi-head attention, incorporating edge features as biases and using stochastic depth for regularization
 class GrangerGraphEncoder(nn.Module):
 
     def __init__(self, F_node, d_embed, n_heads = 4, n_layers = 2,
@@ -180,7 +180,7 @@ class GrangerGraphEncoder(nn.Module):
         h = self.global_norm(h + self.dropout(self.global_grn(h, ctx = global_ctx)))
         return h
 
-
+# Dynamic adjacency module that learns edge features from a base set of learnable parameters and modulates them based on node features, allowing for dynamic attention biases that can adapt to changing graph structures and temporal contexts
 class DynamicAdjacency(nn.Module):
 
     def __init__(self, n_horizons, N, F_edge, n_heads, d_node, dropout = 0.1):
@@ -201,7 +201,8 @@ class DynamicAdjacency(nn.Module):
         dynamic = (mod_i + mod_j).permute(0, 3, 1, 2)
         return self.drop(base_bias.unsqueeze(0) + dynamic)
 
-
+# Learnable graph encoder that processes node features with temporal convolutions and multi-head attention, incorporating dynamic edge features as 
+# biases and using stochastic depth for regularization, allowing for flexible modeling of complex temporal graph data with learnable attention biases that can adapt to changing graph structures and temporal contexts
 class LearnableGraphEncoder(nn.Module):
 
     def __init__(self, F_node, d_embed, N, n_horizons = 4, F_edge = 1,
@@ -276,7 +277,7 @@ class LearnableGraphEncoder(nn.Module):
         h = self.global_norm(h + self.dropout(self.global_grn(h, ctx = global_ctx)))
         return h
 
-
+# Temporal asset encoder that processes node features with temporal convolutions and pooling, incorporating global features and time encoding, and using an LSTM to produce a final embedding for classification or regression tasks
 class TemporalAssetEncoder(nn.Module):
 
     def __init__(self, F_node, F_global, D_time, d_model = 64, d_lstm = 128,
@@ -345,7 +346,8 @@ class TemporalAssetEncoder(nn.Module):
 
         return self.out_norm(h_n[-1] + attn_pool)
 
-
+# Sentiment encoder that processes sentiment scores for multiple assets, applying a GRN to each asset's scores, and then pooling them with attention to 
+# produce a final embedding that can be concatenated with a missingness indicator for classification or regression tasks
 class SentimentEncoder(nn.Module):
 
     def __init__(self, N, F_sentiment, d_out, dropout = 0.1):
@@ -362,7 +364,8 @@ class SentimentEncoder(nn.Module):
         emb = self.out_norm((w * per_asset).sum(dim = 1))
         return torch.cat([emb, sentiment_missing.unsqueeze(-1)], dim = -1)
 
-
+# Cosine classifier that projects input features and computes cosine similarity to learnable class prototypes, with a learnable temperature parameter to control the 
+# sharpness of the output distribution, allowing for flexible classification based on cosine similarity in the embedding space
 class CosineClassifier(nn.Module):
 
     def __init__(self, d_in, n_classes, init_temp = 10.0):
@@ -377,7 +380,8 @@ class CosineClassifier(nn.Module):
         p_norm = F.normalize(self.prototypes, dim = -1)
         return self.log_temp.exp() * (h_norm @ p_norm.T)
 
-
+# Supervised contrastive regularizer that projects features and computes a contrastive loss based on cosine similarity, encouraging samples with the same label to 
+# be closer in the embedding space, with a learnable temperature parameter to control the sharpness of the output distribution, allowing for flexible regularization based on cosine similarity in the embedding space
 class SupConRegularizer(nn.Module):
 
     def __init__(self, d_in, d_proj = 64, temperature = 0.1):
@@ -407,7 +411,8 @@ class SupConRegularizer(nn.Module):
 
         return -(mask * log_prob).sum(dim = 1).div(pos_count).mean()
 
-
+# KL divergence regularizer for R-Drop, computing the symmetric KL divergence between two sets of logits, encouraging consistency between different dropout masks 
+# during training, allowing for regularization that promotes stable predictions under stochastic perturbations
 class RDropKL(nn.Module):
 
     def __init__(self):
@@ -420,7 +425,7 @@ class RDropKL(nn.Module):
         kl_qp = F.kl_div(p, q.exp(), reduction = "batchmean")
         return (kl_pq + kl_qp) * 0.5
 
-
+# Exponential Moving Average (EMA) model wrapper that maintains a shadow copy of the model parameters, allowing for a smoothed version of the model to be used during evaluation, which can improve generalization and stability of predictions
 class EMAModel:
 
     def __init__(self, model, decay = 0.999):
