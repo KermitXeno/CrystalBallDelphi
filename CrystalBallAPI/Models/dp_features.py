@@ -16,11 +16,13 @@ _LOG2 = np.log(2)
 _2LOG2M1 = 2 * np.log(2) - 1
 
 
-def winsorize(df, n_std = 3):
-    mu = df.expanding(min_periods = 20).mean()
-    sigma = df.expanding(min_periods = 20).std().clip(lower = 1e-4)
-    lo = (mu - n_std * sigma).shift(1).ffill()
-    hi = (mu + n_std * sigma).shift(1).ffill()
+def winsorize(df, n_mad = 5, window = 500, min_periods = 50):
+    med = df.rolling(window, min_periods = min_periods).median().shift(1).ffill().bfill()
+    abs_dev = (df - med).abs()
+    mad = abs_dev.rolling(window, min_periods = min_periods).median().shift(1).ffill().bfill()
+    sigma = (mad * 1.4826).clip(lower = 1e-6)
+    lo = med - n_mad * sigma
+    hi = med + n_mad * sigma
     return df.clip(lower = lo, upper = hi, axis = 0)
 
 
@@ -85,7 +87,7 @@ def compute_time_encoding(times_ns, freq):
         np.sin(2 * np.pi * dt.dayofyear / 365.25).astype(np.float32),
         np.cos(2 * np.pi * dt.dayofyear / 365.25).astype(np.float32),
     ]
-    if freq in ("15m", "30m", "1h"):
+    if freq in ("15m", "30m", "1h", "4h"):
         parts += [
             np.sin(2 * np.pi * dt.hour / 24).astype(np.float32),
             np.cos(2 * np.pi * dt.hour / 24).astype(np.float32),
@@ -108,10 +110,11 @@ def compute_edge_features(adj, signal_arr):
 
 
 def build_targets(close, returns, low, horizon):
+    returns = winsorize(returns)
     future_ret = returns.shift(-horizon)
     fwd_vol = returns.rolling(max(2, horizon), min_periods = 2).std().shift(-horizon)
-    sharpe = future_ret / (fwd_vol + 1e-9)
-    drawdown = (low.rolling(horizon, min_periods = 1).min().shift(-horizon) - close) / (close + 1e-9)
+    sharpe = winsorize(future_ret / fwd_vol.clip(lower = 1e-4))
+    drawdown = winsorize((low.rolling(horizon, min_periods = 1).min().shift(-horizon) - close) / close)
     return future_ret, sharpe, drawdown
 
 
@@ -147,8 +150,16 @@ def load_all_symbols(interval):
 def build_price_matrices(data):
     cols = ["close", "open", "high", "low", "volume", "quote_asset_volume",
             "num_trades", "taker_buy_base_volume", "taker_buy_quote_volume"]
-    return {col: data.pivot(index = "open_time", columns = "asset", values = col).ffill()
-            for col in cols}
+    price_cols = ("close", "open", "high", "low")
+    out = {}
+    for col in cols:
+        m = data.pivot(index = "open_time", columns = "asset", values = col)
+        if col in price_cols:
+            m = m.where(m > 0)
+        if col in price_cols + ("volume",):
+            m = m.ffill()
+        out[col] = m
+    return out
 
 
 def parkinson_vol(high, low, window = 14):
@@ -559,3 +570,245 @@ def sentiment_placeholder(n_timesteps, n_assets):
     scores = np.zeros((n_timesteps, n_assets, SENTIMENT_FEATURES), dtype = np.float32)
     missing = np.ones(n_timesteps, dtype = np.float32)
     return scores, missing
+
+
+def compute_realized_kurtosis(r, window, min_periods = None):
+    mp = min_periods or max(window // 4, 8)
+    r2 = r.pow(2)
+    r4 = r.pow(4)
+    m2 = r2.rolling(window, min_periods = mp).mean().clip(lower = 1e-12)
+    m4 = r4.rolling(window, min_periods = mp).mean()
+    return (m4 / m2.pow(2)).clip(0, 50).fillna(3.0)
+
+
+def compute_downside_semivariance(r, window, min_periods = None):
+    mp = min_periods or max(window // 4, 8)
+    neg = r.clip(upper = 0)
+    return neg.pow(2).rolling(window, min_periods = mp).mean().fillna(0)
+
+
+def compute_upside_semivariance(r, window, min_periods = None):
+    mp = min_periods or max(window // 4, 8)
+    pos = r.clip(lower = 0)
+    return pos.pow(2).rolling(window, min_periods = mp).mean().fillna(0)
+
+
+def compute_signed_jump_var(r, window, threshold_std = 2.0, min_periods = None):
+    mp = min_periods or max(window // 4, 8)
+    roll_std = r.rolling(window, min_periods = mp).std().clip(lower = 1e-8)
+    is_jump = r.abs() > threshold_std * roll_std
+    pos_jump = (r * is_jump).clip(lower = 0).pow(2).rolling(window, min_periods = mp).mean()
+    neg_jump = (r * is_jump).clip(upper = 0).pow(2).rolling(window, min_periods = mp).mean()
+    return pos_jump.fillna(0), neg_jump.fillna(0)
+
+
+def compute_price_acceleration(c, short_window = 4, long_window = 24):
+    mom_short = np.log(c / c.shift(short_window))
+    mom_long = np.log(c / c.shift(long_window))
+    mom_short_prev = mom_short.shift(short_window)
+    return (mom_short - mom_short_prev).fillna(0)
+
+
+def compute_relative_strength(r, benchmark_r, window, min_periods = None):
+    mp = min_periods or max(window // 4, 8)
+    cum_asset = r.rolling(window, min_periods = mp).sum()
+    cum_bench = benchmark_r.rolling(window, min_periods = mp).sum()
+    return (cum_asset.sub(cum_bench, axis = 0)).fillna(0)
+
+
+def compute_net_flow_persistence(bp, window = 12, min_periods = 6):
+    centered = bp - 0.5
+    return centered.rolling(window, min_periods = min_periods).mean().fillna(0)
+
+
+def compute_tail_ratio(r, window = 24, min_periods = 12):
+    upper = r.rolling(window, min_periods = min_periods).quantile(0.95)
+    lower = r.rolling(window, min_periods = min_periods).quantile(0.05).abs().clip(lower = 1e-8)
+    return (upper / lower).clip(0.1, 10).fillna(1.0)
+
+
+def compute_max_return(r, window = 24, min_periods = 12):
+    return r.rolling(window, min_periods = min_periods).max().fillna(0)
+
+def compute_regime_scores(px_1h, slope_zscore_scale = 1.5, adx_pivot = 0.20, adx_scale = 50.0,
+                          basket = "inv_vol"):
+    c_all = px_1h["close"]
+    h_all = px_1h["high"]
+    l_all = px_1h["low"]
+    log_ret = np.log(c_all / c_all.shift(1))
+    if basket == "inv_vol":
+        rolling_std = log_ret.rolling(256, min_periods = 64).std().clip(lower = 1e-6)
+        inv_vol = (1.0 / rolling_std).fillna(0.0)
+        weights = inv_vol.div(inv_vol.sum(axis = 1).clip(lower = 1e-9), axis = 0)
+    elif basket == "equal":
+        n = c_all.shape[1]
+        weights = pd.DataFrame(1.0 / n, index = c_all.index, columns = c_all.columns)
+    else:
+        raise ValueError(f"unknown basket weighting: {basket}")
+    basket_log_ret = (log_ret * weights).sum(axis = 1)
+    basket_c = np.exp(basket_log_ret.cumsum().fillna(0.0))
+    basket_h = (h_all * weights).sum(axis = 1)
+    basket_l = (l_all * weights).sum(axis = 1)
+    ema = basket_c.ewm(span = 256, adjust = False).mean()
+    ema_slope_pct = ema.diff() / ema.shift(1).clip(lower = 1e-9)
+    slope_mean = ema_slope_pct.rolling(256, min_periods = 64).mean()
+    slope_std = ema_slope_pct.rolling(256, min_periods = 64).std().clip(lower = 1e-9)
+    slope_z = ((ema_slope_pct - slope_mean) / slope_std).fillna(0.0)
+    adx, _ = compute_adx(basket_h.to_frame("b"), basket_l.to_frame("b"), basket_c.to_frame("b"), 16)
+    adx = adx.iloc[:, 0]
+    trend_strength = np.tanh(slope_z * slope_zscore_scale)
+    adx_strength = 1.0 / (1.0 + np.exp(-(adx.fillna(0.0) - adx_pivot) * adx_scale))
+    bull = (trend_strength.clip(lower = 0.0) * adx_strength).clip(0.0, 1.0)
+    bear = ((-trend_strength).clip(lower = 0.0) * adx_strength).clip(0.0, 1.0)
+    neutral = (1.0 - bull - bear).clip(0.0, 1.0)
+    total = (bull + bear + neutral).clip(lower = 1e-9)
+    bull = (bull / total).astype(np.float32)
+    bear = (bear / total).astype(np.float32)
+    neutral = (neutral / total).astype(np.float32)
+    return pd.DataFrame({"bull": bull, "bear": bear, "neutral": neutral}, index = c_all.index)
+
+
+HORIZON_BARS_15M = {"1h": 4, "4h": 16, "16h": 64, "64h": 256}
+
+
+def block_offsets(horizon_bars, n_blocks = 4, n_subpoints = 4):
+    if horizon_bars == n_blocks:
+        return None
+    spacing = horizon_bars // n_blocks
+    shift = spacing // n_blocks
+    if shift < 1:
+        return None
+    block_offs = []
+    for b in range(n_blocks):
+        block_end_offset = b * shift
+        sub_offs = [block_end_offset + s * spacing for s in range(n_subpoints)]
+        block_offs.append(sub_offs)
+    return block_offs
+
+
+def build_block_bars(px_15m, horizon_bars, n_blocks = 4, n_subpoints = 4):
+    o = px_15m["open"]
+    h = px_15m["high"]
+    l = px_15m["low"]
+    c = px_15m["close"]
+    v = px_15m["volume"]
+    offsets = block_offsets(horizon_bars, n_blocks, n_subpoints)
+    if offsets is None:
+        return None
+    blocks = []
+    for sub_offs in offsets:
+        sub_o_list = [o.shift(off) for off in sub_offs]
+        sub_h_list = [h.shift(off) for off in sub_offs]
+        sub_l_list = [l.shift(off) for off in sub_offs]
+        sub_c_list = [c.shift(off) for off in sub_offs]
+        sub_v_list = [v.shift(off) for off in sub_offs]
+        block_o = sum(sub_o_list) / n_subpoints
+        block_h = sub_h_list[0]
+        for s in sub_h_list[1:]:
+            block_h = np.maximum(block_h, s)
+        block_l = sub_l_list[0]
+        for s in sub_l_list[1:]:
+            block_l = np.minimum(block_l, s)
+        block_c = sum(sub_c_list) / n_subpoints
+        block_v = sum(sub_v_list) / n_subpoints
+        blocks.append({
+            "open": block_o, "high": block_h, "low": block_l,
+            "close": block_c, "volume": block_v,
+        })
+    return blocks
+
+
+def build_1h_subpoint_bars(px_15m, n_subpoints = 4):
+    o = px_15m["open"]
+    h = px_15m["high"]
+    l = px_15m["low"]
+    c = px_15m["close"]
+    v = px_15m["volume"]
+    bars = []
+    for s in range(n_subpoints):
+        bars.append({
+            "open": o.shift(s), "high": h.shift(s), "low": l.shift(s),
+            "close": c.shift(s), "volume": v.shift(s),
+        })
+    return bars
+
+
+def aggregate_blocks_mean_slope(block_features):
+    n_blocks = len(block_features)
+    out = {}
+    feat_names = list(block_features[0].keys())
+    x_centered = np.arange(n_blocks, dtype = np.float64) - (n_blocks - 1) / 2.0
+    x_var = (x_centered ** 2).sum()
+    for name in feat_names:
+        stacked = np.stack([bf[name].values for bf in block_features], axis = 0)
+        mean_arr = stacked.mean(axis = 0)
+        diffs = stacked - mean_arr[None]
+        slope_arr = (x_centered[:, None, None] * diffs).sum(axis = 0) / x_var
+        idx = block_features[0][name].index
+        cols = block_features[0][name].columns
+        out[f"{name}_mean"] = pd.DataFrame(mean_arr, index = idx, columns = cols)
+        out[f"{name}_slope"] = pd.DataFrame(slope_arr, index = idx, columns = cols)
+    return out
+
+
+def compute_horizon_indicators(px_15m, lookback):
+    o = px_15m["open"]
+    h = px_15m["high"]
+    l = px_15m["low"]
+    c = px_15m["close"]
+    v = px_15m["volume"]
+    r = np.log(c / c.shift(1))
+    r_horizon = np.log(c / c.shift(max(lookback, 1)))
+    bb_mid = c.rolling(lookback).mean()
+    bb_std = c.rolling(lookback).std()
+    macd_fast = c.ewm(span = lookback, adjust = False).mean()
+    macd_slow = c.ewm(span = lookback * 4, adjust = False).mean()
+    macd_line = macd_fast - macd_slow
+    macd_sig = macd_line.ewm(span = lookback, adjust = False).mean()
+    adx, di_diff = compute_adx(h, l, c, lookback)
+    return {
+        "ret": r_horizon,
+        "vol_yz": yang_zhang_vol(h, l, c, o, lookback),
+        "rsi": compute_rsi(c, lookback),
+        "macd_hist": (macd_line - macd_sig) / (c + 1e-9),
+        "bb_pos": (c - (bb_mid - 2 * bb_std)) / (4 * bb_std + 1e-9),
+        "bb_width": 4 * bb_std / (bb_mid + 1e-9),
+        "adx": adx,
+        "di_diff": di_diff,
+        "hl_spread": (h - l) / (c + 1e-9),
+        "oc_body": (c - o) / (o + 1e-9),
+        "vol_zscore": v / (v.rolling(lookback * 4).mean() + 1e-9),
+        "amihud": amihud_illiq(r, v, lookback),
+        "hurst": hurst_proxy(r, window = lookback * 4, k = 4),
+    }
+
+
+def sample_at_block_offsets(indicator_dict, horizon_bars, n_blocks = 4, n_subpoints = 4):
+    if horizon_bars <= n_blocks:
+        sub_offsets = [[s] for s in range(n_blocks)]
+    else:
+        sub_offsets = block_offsets(horizon_bars, n_blocks, n_subpoints)
+    block_features = []
+    for sub_offs in sub_offsets:
+        block_feat = {}
+        for name, df in indicator_dict.items():
+            sampled = [df.shift(off) for off in sub_offs]
+            block_feat[name] = sum(sampled) / len(sampled)
+        block_features.append(block_feat)
+    return block_features
+
+
+def compute_regime_scores_15m(px_15m):
+    c_all = px_15m["close"]
+    h_all = px_15m["high"]
+    l_all = px_15m["low"]
+    idx_1h = c_all.index[3::4]
+    c_1h = c_all.reindex(idx_1h)
+    h_1h = h_all.reindex(idx_1h)
+    l_1h = l_all.reindex(idx_1h)
+    px_1h = {"close": c_1h, "high": h_1h, "low": l_1h}
+    scores_1h = compute_regime_scores(px_1h)
+    scores_15m = scores_1h.reindex(c_all.index, method = "ffill")
+    scores_15m = scores_15m.fillna(pd.DataFrame({"bull": 0.0, "bear": 0.0, "neutral": 1.0},
+                                                  index = c_all.index))
+    return scores_15m

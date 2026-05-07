@@ -13,8 +13,11 @@ BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(BASE_DIR, exist_ok = True)
  
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "LTCUSDT", "AVAXUSDT", "LINKUSDT", "MATICUSDT",
+    "AAVEUSDT", "ADAUSDT", "ALGOUSDT", "ATOMUSDT", "AVAXUSDT",
+    "BCHUSDT", "BNBUSDT", "BTCUSDT", "DOTUSDT", "ETCUSDT",
+    "ETHUSDT", "FILUSDT", "LINKUSDT", "LTCUSDT",
+    "MATICUSDT", "NEARUSDT", "SOLUSDT", "UNIUSDT",
+    "XRPUSDT", "XTZUSDT",
 ]
  
 INTERVALS = {

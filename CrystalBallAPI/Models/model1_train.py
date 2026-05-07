@@ -9,39 +9,37 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model1_layers import (
-    GrangerGraphEncoder, TemporalAssetEncoder, SentimentEncoder,
+    LearnableGraphEncoder, TemporalAssetEncoder, SentimentEncoder,
     GRN, SupConRegularizer, EMAModel,
 )
 from ds_struc_wstg import Model1Dataset, BASE_DIR
 
 
 DEFAULT_CFG = {
-    "N": 10,
-    "F_node": 42,
-    "F_global": 15,
-    "D_time": 7,
+    "N": 20,
+    "F_node": 104,
+    "F_global": 8,
+    "D_time": 9,
     "F_sentiment": 5,
-    "window": 96,
+    "use_sentiment": False,
+    "window": 672,
     "n_regime_classes": 3,
-
+    "n_horizons": 4,
+    "F_edge": 1,
     "d_model": 64,
-    "d_lstm": 96,
-    "d_embed": 64,
+    "d_lstm": 128,
+    "d_embed": 96,
     "n_heads": 4,
     "n_graph_layers": 2,
     "n_lstm_layers": 1,
-    "F_edge": 4,
-    "d_edge": 16,
-    "graph_window": 8,
-    "F_btc_raw": 4,
+    "graph_window": 64,
+    "F_btc_raw": 3,
     "d_btc": 32,
     "d_sentiment": 24,
     "pool_stride": 4,
     "dropout": 0.20,
     "btc_drop": 0.20,
     "stoch_depth": 0.15,
-    "edge_drop": 0.15,
-
     "label_smoothing": 0.08,
     "lambda_transition": 0.10,
     "lambda_aux": 0.15,
@@ -92,18 +90,19 @@ class Model1(nn.Module):
         n_cls = cfg["n_regime_classes"]
         F_btc_raw = cfg.get("F_btc_raw", 4)
         d_btc = cfg.get("d_btc", 32)
+        n_horizons = cfg.get("n_horizons", 4)
+        F_edge = cfg.get("F_edge", 1)
 
         self.graph_window = cfg["graph_window"]
         self.F_btc_raw = F_btc_raw
+        self.use_sentiment = cfg.get("use_sentiment", False)
+        self.d_sentiment = d_sentiment
 
-        self.graph_encoder = GrangerGraphEncoder(
-            F_node, d_embed,
+        self.graph_encoder = LearnableGraphEncoder(
+            F_node, d_embed, N,
+            n_horizons = n_horizons, F_edge = F_edge,
             n_heads = n_heads, n_layers = n_graph_layers,
-            F_edge = cfg["F_edge"], d_edge = cfg["d_edge"],
-            dropout = dropout,
-            stoch_depth = cfg.get("stoch_depth", 0.1),
-            edge_drop = cfg.get("edge_drop", 0.1),
-            k_graph = cfg["graph_window"])
+            dropout = dropout, stoch_depth = cfg.get("stoch_depth", 0.1))
 
         self.temporal_encoder = TemporalAssetEncoder(
             F_node, F_global, D_time,
@@ -167,7 +166,6 @@ class Model1(nn.Module):
         node_features = batch["node_features"]
         global_features = batch["global_features"]
         time_enc = batch["time_enc"]
-        edge_features = batch["edge_features"]
         sentiment_scores = batch["sentiment_scores"]
         sentiment_missing = batch["sentiment_missing"]
 
@@ -178,8 +176,7 @@ class Model1(nn.Module):
 
         gw = self.graph_window
         node_feats_graph = node_features[:, -gw :, :, :]
-        node_emb = self.graph_encoder(
-            node_feats_graph, edge_features, asset_embed = a_graph)
+        node_emb = self.graph_encoder(node_feats_graph, asset_embed = a_graph)
         graph_mean = node_emb.mean(dim = 1)
         graph_max = node_emb.max(dim = 1).values
         graph_vec = torch.cat([graph_mean, graph_max], dim = -1)
@@ -187,7 +184,12 @@ class Model1(nn.Module):
         temporal_fused = self.temporal_gate(temporal_vec, ctx = graph_vec)
         graph_fused = self.graph_gate(graph_vec, ctx = temporal_vec)
 
-        sent_vec = self.sentiment_encoder(sentiment_scores, sentiment_missing)
+        if self.use_sentiment:
+            sent_vec = self.sentiment_encoder(sentiment_scores, sentiment_missing)
+        else:
+            B = temporal_fused.shape[0]
+            sent_vec = torch.zeros(B, self.d_sentiment + 1, device = temporal_fused.device,
+                                   dtype = temporal_fused.dtype)
 
         ctx_vec = torch.cat([temporal_fused, graph_fused, sent_vec], dim = -1)
 
@@ -220,22 +222,24 @@ class Model1Loss(nn.Module):
 
     def __init__(self, class_weights, transition_pos_weight,
                  lambda_transition = 0.10, lambda_aux = 0.15,
-                 label_smoothing = 0.08):
+                 label_smoothing = 0.08, kl_weight = 0.20):
         super().__init__()
-        self.regime_loss = nn.CrossEntropyLoss(
-            weight = class_weights, label_smoothing = label_smoothing)
+        self.ce_loss = nn.CrossEntropyLoss(weight = class_weights, label_smoothing = label_smoothing)
         self.transition_loss = nn.BCEWithLogitsLoss(pos_weight = transition_pos_weight)
         self.trending_loss = nn.BCEWithLogitsLoss()
         self.aux_reg = nn.SmoothL1Loss()
         self.lambda_transition = lambda_transition
         self.lambda_aux = lambda_aux
+        self.kl_weight = kl_weight
 
-    def forward(self, regime_logits, transition_logit, regime_labels,
+    def forward(self, regime_logits, transition_logit, regime_labels, regime_scores,
                 transition_labels, aux = None, adx_target = None):
-        r_loss = self.regime_loss(regime_logits, regime_labels)
+        ce = self.ce_loss(regime_logits, regime_labels)
+        log_pred = F.log_softmax(regime_logits, dim = -1)
+        kl = F.kl_div(log_pred, regime_scores, reduction = "batchmean")
+        r_loss = (1.0 - self.kl_weight) * ce + self.kl_weight * kl
         t_loss = self.transition_loss(transition_logit, transition_labels)
         total = r_loss + self.lambda_transition * t_loss
-
         if aux is not None:
             trending_target = (regime_labels < 2).float()
             total = total + self.lambda_aux * self.trending_loss(
@@ -243,13 +247,15 @@ class Model1Loss(nn.Module):
             if adx_target is not None:
                 total = total + self.lambda_aux * self.aux_reg(
                     aux["adx_pred"], adx_target)
-
         return total, r_loss.detach(), t_loss.detach()
 
 
 def compute_class_weights(dataset, n_classes = 3, power = 1.0):
-    labels = dataset.regime_labels
-    counts = np.bincount(labels.astype(np.int64), minlength = n_classes).astype(np.float32)
+    if hasattr(dataset, "regime_scores"):
+        labels = dataset.regime_scores.argmax(axis = 1).astype(np.int64)
+    else:
+        labels = dataset.regime_labels.astype(np.int64)
+    counts = np.bincount(labels, minlength = n_classes).astype(np.float32)
     counts = np.maximum(counts, 1.0)
     inv_freq = counts.sum() / (n_classes * counts)
     raw = np.power(inv_freq, power)
@@ -351,6 +357,7 @@ def train_epoch(model, loader, optimizer, loss_fn, scaler, device, grad_clip,
 
     for step, batch in enumerate(loader):
         batch = _to_device(batch, device)
+        regime_scores = batch.pop("regime_score")
         regime_labels = batch.pop("regime_label")
         transition_labels = batch.pop("transition_label")
         adx_target = batch["btc_raw"][:, 2]
@@ -360,7 +367,7 @@ def train_epoch(model, loader, optimizer, loss_fn, scaler, device, grad_clip,
         with torch.amp.autocast(device_type = device.type, enabled = scaler is not None):
             regime_logits, transition_logit, combined, aux = model(batch)
             loss, r_loss, t_loss = loss_fn(
-                regime_logits, transition_logit, regime_labels, transition_labels,
+                regime_logits, transition_logit, regime_labels, regime_scores, transition_labels,
                 aux = aux, adx_target = adx_target)
 
             if lambda_supcon > 0 and model.supcon is not None:
@@ -405,12 +412,13 @@ def eval_epoch(model, loader, loss_fn, device):
 
     for batch in loader:
         batch = _to_device(batch, device)
+        regime_scores = batch.pop("regime_score")
         regime_labels = batch.pop("regime_label")
         transition_labels = batch.pop("transition_label")
 
         regime_logits, transition_logit, _, _ = model(batch)
         loss, r_loss, t_loss = loss_fn(
-            regime_logits, transition_logit, regime_labels, transition_labels)
+            regime_logits, transition_logit, regime_labels, regime_scores, transition_labels)
 
         bs = regime_labels.size(0)
         total_loss += loss.item() * bs
@@ -459,8 +467,7 @@ def train(cfg = None):
     print(f"Device: {device}")
 
     npz_path = os.path.join(BASE_DIR, "model1_dataset.npz")
-    dataset = Model1Dataset(npz_path, window = cfg["window"],
-                            graph_window = cfg["graph_window"])
+    dataset = Model1Dataset(npz_path, window = cfg["window"])
     print(f"Dataset: T={dataset.T}  F_node={dataset.F_node}  "
           f"F_global={dataset.F_global}  samples={len(dataset)}")
 
@@ -468,8 +475,7 @@ def train(cfg = None):
     cfg["F_global"] = dataset.F_global
     cfg["D_time"] = dataset.D_time
     cfg["F_sentiment"] = dataset.F_sentiment
-    cfg["F_edge"] = dataset.F_edge
-    cfg["F_btc_raw"] = getattr(dataset, "F_btc_raw", 4)
+    cfg["F_btc_raw"] = getattr(dataset, "F_btc_raw", 3)
 
     train_sub, val_sub, test_sub = dataset.chronological_split(
         train = 0.70, val = 0.15)
@@ -495,8 +501,11 @@ def train(cfg = None):
     class_weights = compute_class_weights(base_ds, n_classes = n_cls).to(device)
     trans_pos_weight = compute_transition_pos_weight(
         base_ds, cap = cfg["transition_pos_weight_cap"]).to(device)
-    labels = base_ds.regime_labels
-    counts = np.bincount(labels.astype(np.int64), minlength = n_cls)
+    if hasattr(base_ds, "regime_scores"):
+        labels = base_ds.regime_scores.argmax(axis = 1).astype(np.int64)
+    else:
+        labels = base_ds.regime_labels.astype(np.int64)
+    counts = np.bincount(labels, minlength = n_cls)
     print(f"Class counts: {counts.tolist()}  weights: {[round(w, 3) for w in class_weights.tolist()]}")
     n_pos = (base_ds.transition_labels == 1).sum()
     print(f"Transition labels: {n_pos}/{len(base_ds.transition_labels)} positive  pos_weight={trans_pos_weight.item():.2f}")

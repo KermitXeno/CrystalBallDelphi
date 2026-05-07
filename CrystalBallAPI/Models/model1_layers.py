@@ -34,27 +34,19 @@ class CausalConv1d(nn.Module):
         return self.conv(x)
 
 
-class TemporalEdgeEncoder(nn.Module):
+class FunctionalTimeEncoding(nn.Module):
 
-    def __init__(self, F_edge, d_edge, dropout = 0.1):
+    def __init__(self, d_embed, init_scale = 0.1):
         super().__init__()
-        self.conv1 = nn.Conv1d(F_edge, d_edge, kernel_size = 3, padding = 0)
-        self.conv2 = nn.Conv1d(d_edge, d_edge, kernel_size = 3, padding = 0)
-        self.temporal_attn = nn.Linear(d_edge, 1, bias = False)
-        self.norm = nn.LayerNorm(d_edge)
-        self.drop = nn.Dropout(dropout)
+        assert d_embed % 2 == 0
+        self.d_half = d_embed // 2
+        self.freqs = nn.Parameter(torch.randn(self.d_half) * init_scale)
+        self.phase = nn.Parameter(torch.zeros(self.d_half))
+        self.scale = self.d_half ** -0.5
 
-    def forward(self, edge_features):
-        B, k, N, _, Fe = edge_features.shape
-        x = edge_features.permute(0, 2, 3, 4, 1).reshape(B * N * N, Fe, k)
-        x = F.pad(x, (2, 0))
-        x = F.elu(self.conv1(x))
-        x = F.pad(x, (2, 0))
-        x = self.conv2(x)
-        x = x.transpose(1, 2)
-        w = F.softmax(self.temporal_attn(x), dim = 1)
-        x = (w * x).sum(dim = 1)
-        return self.drop(self.norm(x.view(B, N, N, -1)))
+    def forward(self, t):
+        x = t.unsqueeze(-1) * self.freqs + self.phase
+        return torch.cat([x.cos(), x.sin()], dim = -1) * self.scale
 
 
 class EdgeBiasNet(nn.Module):
@@ -125,12 +117,10 @@ class GrangerAttention(nn.Module):
 class GrangerGraphEncoder(nn.Module):
 
     def __init__(self, F_node, d_embed, n_heads = 4, n_layers = 2,
-                 F_edge = 4, d_edge = 16, dropout = 0.1,
-                 stoch_depth = 0.1, edge_drop = 0.1, k_graph = 8):
+                 F_edge = 4, dropout = 0.1, stoch_depth = 0.1, edge_drop = 0.1):
         super().__init__()
-        self.temporal_edge_enc = TemporalEdgeEncoder(F_edge, d_edge, dropout = dropout)
         self.input_proj = nn.Linear(F_node, d_embed)
-        self.time_embed = nn.Parameter(torch.randn(1, k_graph, 1, d_embed) * 0.01)
+        self.time_enc = FunctionalTimeEncoding(d_embed)
 
         self.node_temporal_conv1 = CausalConv1d(d_embed, d_embed, kernel_size = 3)
         self.node_temporal_conv2 = CausalConv1d(d_embed, d_embed, kernel_size = 3)
@@ -139,7 +129,7 @@ class GrangerGraphEncoder(nn.Module):
 
         self.attn_layers = nn.ModuleList([
             GrangerAttention(d_embed, d_embed, n_heads = n_heads,
-                             F_edge = d_edge, dropout = dropout,
+                             F_edge = F_edge, dropout = dropout,
                              edge_drop = edge_drop)
             for _ in range(n_layers)
         ])
@@ -164,10 +154,9 @@ class GrangerGraphEncoder(nn.Module):
         h = self.input_proj(node_features.reshape(B * k * N, Fn))
         h = h.view(B, k, N, d)
 
-        te = self.time_embed
-        if te.shape[1] != k:
-            te = te[:, -k:, :, :] if te.shape[1] > k else F.pad(te, (0, 0, 0, 0, k - te.shape[1], 0))
-        h = h + te
+        positions = torch.arange(k, device = h.device, dtype = h.dtype) - (k - 1)
+        t_emb = self.time_enc(positions)
+        h = h + t_emb[None, :, None, :]
 
         if asset_embed is not None:
             h = h + asset_embed[None, None, :, :]
@@ -180,13 +169,109 @@ class GrangerGraphEncoder(nn.Module):
         h_last = h[:, -1, :, :]
         h = self.node_temporal_norm(self.node_temporal_drop(ht) + h_last)
 
-        edge_enc = self.temporal_edge_enc(edge_features)
+        edge_now = edge_features[:, -1]
         for attn, a_norm, sd, ffn, f_norm in zip(
                 self.attn_layers, self.attn_norms, self.stoch_depths,
                 self.ffn_layers, self.ffn_norms):
-            h = a_norm(h + sd(self.dropout(attn(h, edge_enc))))
+            h = a_norm(h + sd(self.dropout(attn(h, edge_now))))
             h = f_norm(h + self.dropout(ffn(h)))
 
+        global_ctx = h.mean(dim = 1, keepdim = True).expand(-1, h.shape[1], -1)
+        h = self.global_norm(h + self.dropout(self.global_grn(h, ctx = global_ctx)))
+        return h
+
+
+class DynamicAdjacency(nn.Module):
+
+    def __init__(self, n_horizons, N, F_edge, n_heads, d_node, dropout = 0.1):
+        super().__init__()
+        self.base_adj = nn.Parameter(torch.randn(n_horizons, N, N, F_edge) * 0.1)
+        self.base_proj = nn.Linear(F_edge * n_horizons, n_heads)
+        self.node_key = nn.Linear(d_node, n_heads, bias = False)
+        self.drop = nn.Dropout(dropout)
+        self.n_heads = n_heads
+
+    def forward(self, h):
+        n_h, N, _, F_e = self.base_adj.shape
+        flat = self.base_adj.permute(1, 2, 0, 3).reshape(N, N, n_h * F_e)
+        base_bias = self.base_proj(flat).permute(2, 0, 1)
+        nk = self.node_key(h)
+        mod_i = nk.unsqueeze(2)
+        mod_j = nk.unsqueeze(1)
+        dynamic = (mod_i + mod_j).permute(0, 3, 1, 2)
+        return self.drop(base_bias.unsqueeze(0) + dynamic)
+
+
+class LearnableGraphEncoder(nn.Module):
+
+    def __init__(self, F_node, d_embed, N, n_horizons = 4, F_edge = 1,
+                 n_heads = 4, n_layers = 2, dropout = 0.1, stoch_depth = 0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(F_node, d_embed)
+        self.time_enc = FunctionalTimeEncoding(d_embed)
+        self.node_temporal_conv1 = CausalConv1d(d_embed, d_embed, kernel_size = 3)
+        self.node_temporal_conv2 = CausalConv1d(d_embed, d_embed, kernel_size = 3)
+        self.node_temporal_norm = nn.LayerNorm(d_embed)
+        self.node_temporal_drop = nn.Dropout(dropout)
+        self.dynamic_adj = DynamicAdjacency(n_horizons, N, F_edge, n_heads, d_embed, dropout = dropout)
+        self.attn_layers = nn.ModuleList()
+        self.attn_norms = nn.ModuleList()
+        self.ffn_layers = nn.ModuleList()
+        self.ffn_norms = nn.ModuleList()
+        drop_rates = [stoch_depth * (i + 1) / n_layers for i in range(n_layers)]
+        self.stoch_depths = nn.ModuleList([StochasticDepth(p) for p in drop_rates])
+        for _ in range(n_layers):
+            self.attn_layers.append(self._make_attn(d_embed, n_heads, dropout))
+            self.attn_norms.append(nn.LayerNorm(d_embed))
+            self.ffn_layers.append(GRN(d_embed, d_embed, dropout = dropout))
+            self.ffn_norms.append(nn.LayerNorm(d_embed))
+        self.global_grn = GRN(d_embed, d_embed, d_ctx = d_embed, dropout = dropout)
+        self.global_norm = nn.LayerNorm(d_embed)
+        self.dropout = nn.Dropout(dropout)
+
+    def _make_attn(self, d, n_heads, dropout):
+        return nn.ModuleDict({
+            "W_q": nn.Linear(d, d, bias = False),
+            "W_k": nn.Linear(d, d, bias = False),
+            "W_v": nn.Linear(d, d, bias = False),
+            "W_o": nn.Linear(d, d),
+            "drop": nn.Dropout(dropout),
+        })
+
+    def _run_attn(self, attn_mod, h, edge_bias):
+        B, N, _ = h.shape
+        n_heads = edge_bias.shape[1]
+        d_head = h.shape[-1] // n_heads
+        scale = d_head ** -0.5
+        Q = attn_mod["W_q"](h).view(B, N, n_heads, d_head).transpose(1, 2)
+        K = attn_mod["W_k"](h).view(B, N, n_heads, d_head).transpose(1, 2)
+        V = attn_mod["W_v"](h).view(B, N, n_heads, d_head).transpose(1, 2)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * scale + edge_bias
+        attn = attn_mod["drop"](F.softmax(scores, dim = -1))
+        out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, N, -1)
+        return attn_mod["W_o"](out)
+
+    def forward(self, node_features, asset_embed = None):
+        B, k, N, Fn = node_features.shape
+        d = self.input_proj.out_features
+        h = self.input_proj(node_features.reshape(B * k * N, Fn)).view(B, k, N, d)
+        positions = torch.arange(k, device = h.device, dtype = h.dtype) - (k - 1)
+        t_emb = self.time_enc(positions)
+        h = h + t_emb[None, :, None, :]
+        if asset_embed is not None:
+            h = h + asset_embed[None, None, :, :]
+        ht = h.permute(0, 2, 3, 1).reshape(B * N, d, k)
+        ht = F.elu(self.node_temporal_conv1(ht))
+        ht = self.node_temporal_conv2(ht)
+        ht = ht[:, :, -1].view(B, N, d)
+        h_last = h[:, -1, :, :]
+        h = self.node_temporal_norm(self.node_temporal_drop(ht) + h_last)
+        edge_bias = self.dynamic_adj(h)
+        for attn, a_norm, sd, ffn, f_norm in zip(
+                self.attn_layers, self.attn_norms, self.stoch_depths,
+                self.ffn_layers, self.ffn_norms):
+            h = a_norm(h + sd(self.dropout(self._run_attn(attn, h, edge_bias))))
+            h = f_norm(h + self.dropout(ffn(h)))
         global_ctx = h.mean(dim = 1, keepdim = True).expand(-1, h.shape[1], -1)
         h = self.global_norm(h + self.dropout(self.global_grn(h, ctx = global_ctx)))
         return h
