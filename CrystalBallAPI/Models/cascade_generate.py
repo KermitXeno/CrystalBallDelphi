@@ -1,181 +1,103 @@
 import os
 import sys
-import argparse
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dp_download import BASE_DIR
-from model1_train import Model1, DEFAULT_CFG
-from ds_struc_wstg import Model1Dataset, set_model1_outputs
+from ds_struc_wstg import BASE_DIR, ASSETS
 
 
-def derive_m1_out_dim(n_cls):
-    return n_cls + 3
+def load_model1():
+    from xgboost import XGBRegressor
+    ckpt_dir = os.path.join(BASE_DIR, "checkpoints")
+    dir_model = XGBRegressor()
+    dir_model.load_model(os.path.join(ckpt_dir, "model1_direction.json"))
+    phase_model = XGBRegressor()
+    phase_model.load_model(os.path.join(ckpt_dir, "model1_phase.json"))
+    return dir_model, phase_model
 
 
-def load_model_from_ckpt(ckpt_path, device, use_ema):
-    ckpt = torch.load(ckpt_path, map_location = device, weights_only = False)
-    cfg = {**DEFAULT_CFG, **ckpt.get("cfg", {})}
-    model = Model1(cfg).to(device)
-    if use_ema and "ema" in ckpt:
-        print("loading ema shadow weights")
-        ema_state = ckpt["ema"]
-        if isinstance(ema_state, dict) and "shadow" in ema_state:
-            model.load_state_dict(ema_state["shadow"])
-        else:
-            model.load_state_dict(ema_state)
-    else:
-        model.load_state_dict(ckpt["model"])
+def model1_predict(dir_model, phase_model, X):
+    dir_prob = dir_model.predict(X).clip(0.0, 1.0)
+    phase_prob = phase_model.predict(X).clip(0.0, 1.0)
+    dir_conf = np.abs(2.0 * dir_prob - 1.0)
+    phase_conf = np.abs(2.0 * phase_prob - 1.0)
+    transition_intensity = (1.0 - dir_conf) * (1.0 - phase_conf)
+    return np.stack([dir_prob, phase_prob, dir_conf, phase_conf, transition_intensity], axis = -1).astype(np.float32)
+
+
+def generate_training_outputs():
+    from model1_train import load_features
+    dir_model, phase_model = load_model1()
+    npz_path = os.path.join(BASE_DIR, "model1_dataset.npz")
+    X, _, _, times, _ = load_features(npz_path)
+    X = np.nan_to_num(X, nan = 0.0)
+    outputs_15m = model1_predict(dir_model, phase_model, X)
+    outputs_1h = outputs_15m[3::4]
+    times_1h = times[3::4]
+    print(f"Model1 outputs: {outputs_15m.shape} (15m) -> {outputs_1h.shape} (1h)")
+    out_path = os.path.join(BASE_DIR, "model1_outputs.npz")
+    np.savez_compressed(out_path,
+                        model1_outputs_15m = outputs_15m, times_15m = times,
+                        model1_outputs_1h = outputs_1h, times_1h = times_1h)
+    print(f"Saved {out_path}")
+    return outputs_15m, times, outputs_1h, times_1h
+
+
+def load_model2(device = "cpu"):
+    import torch
+    from model2_train import load_ckpt
+    ckpt_path = os.path.join(BASE_DIR, "checkpoints", "model2_best.pt")
+    model, ckpt = load_ckpt(ckpt_path, device)
     model.eval()
-    return model, cfg, ckpt
+    return model, ckpt
 
 
-@torch.no_grad()
-def collect_logits(model, loader, device):
-    all_regime, all_trans, all_trend = [], [], []
-    for batch in loader:
-        for k in batch:
-            if torch.is_tensor(batch[k]):
-                batch[k] = batch[k].to(device)
-        batch.pop("regime_label", None)
-        batch.pop("transition_label", None)
-        regime_logits, transition_logit, _, aux = model(batch)
-        all_regime.append(regime_logits.cpu().numpy())
-        all_trans.append(transition_logit.cpu().numpy())
-        all_trend.append(aux["trending_logit"].cpu().numpy())
-    return (np.concatenate(all_regime), np.concatenate(all_trans), np.concatenate(all_trend))
-
-
-def pack_m1_out(regime_logits, trans_logits, trend_logits, n_cls, target_dim):
-    x = regime_logits - regime_logits.max(axis = -1, keepdims = True)
-    e = np.exp(x)
-    probs = e / e.sum(axis = -1, keepdims = True)
-    conf = probs.max(axis = -1, keepdims = True)
-    trans_prob = (1.0 / (1.0 + np.exp(-trans_logits)))[:, None]
-    trend_prob = (1.0 / (1.0 + np.exp(-trend_logits)))[:, None]
-    base = np.concatenate([probs, trans_prob, conf, trend_prob], axis = -1).astype(np.float32)
-    if base.shape[1] > target_dim:
-        raise ValueError(
-            f"packed m1 dim {base.shape[1]} exceeds m2 model1_outputs slot dim {target_dim}. "
-            f"increase the model1_outputs placeholder in dp_preproc_model2.py to at least "
-            f"shape (T_1h, {base.shape[1]}) and rerun preprocessing.")
-    if base.shape[1] < target_dim:
-        pad = np.zeros((base.shape[0], target_dim - base.shape[1]), dtype = np.float32)
-        base = np.concatenate([base, pad], axis = -1)
-    return base
-
-
-def align_to_target_times(source_times, source_m1, target_times):
-    src_sorted_idx = np.argsort(source_times)
-    src_t = source_times[src_sorted_idx]
-    src_v = source_m1[src_sorted_idx]
-    n_src = len(src_t)
-    pos = np.searchsorted(src_t, target_times)
-    pos_safe = np.minimum(pos, max(n_src - 1, 0))
-    matched = (n_src > 0) & (src_t[pos_safe] == target_times)
-    out = np.zeros((len(target_times), source_m1.shape[1]), dtype = np.float32)
-    out[matched] = src_v[pos_safe[matched]]
-    return out, int(matched.sum())
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default = os.path.join(BASE_DIR, "checkpoints", "model1_best.pt"))
-    ap.add_argument("--m1_npz", default = os.path.join(BASE_DIR, "model1_dataset.npz"))
-    ap.add_argument("--m2_npz", default = os.path.join(BASE_DIR, "model2_dataset.npz"))
-    ap.add_argument("--batch_size", type = int, default = 128)
-    ap.add_argument("--use_ema", action = "store_true")
-    ap.add_argument("--min_coverage", type = float, default = 0.95, help = "minimum fraction of m2 timestamps that must be matched (default 0.95)")
-    ap.add_argument("--allow_low_coverage", action = "store_true",                                e is below --min_coverage")
-    args = ap.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device = {device}")
-    print(f"loading checkpoint {args.ckpt}")
-    model, cfg, ckpt = load_model_from_ckpt(args.ckpt, device, args.use_ema)
-
-    n_cls = cfg["n_regime_classes"]
-    expected_dim = derive_m1_out_dim(n_cls)
-    print(f"n_regime_classes = {n_cls}  packed m1 vector size = {expected_dim} "
-          f"(= {n_cls} regime probs + 1 trans prob + 1 max conf + 1 trend prob)")
-
-    print(f"reading m2 dataset metadata from {args.m2_npz}")
-    m2_meta = np.load(args.m2_npz)
-    target_times = m2_meta["times_1h"].astype(np.int64)
-    target_shape = m2_meta["model1_outputs"].shape
-    target_dim = target_shape[1]
-    print(f"m2 timeline length = {len(target_times)}  m1 slot shape = {target_shape}")
-
-    if target_dim < expected_dim:
-        raise ValueError(
-            f"m2 model1_outputs dim {target_dim} too small for n_cls = {n_cls} "
-            f"(needs at least {expected_dim}). update the placeholder in dp_preproc_model2.py "
-            f"to shape ({target_shape[0]}, {expected_dim}) and rerun preprocessing.")
-
-    print(f"loading m1 dataset {args.m1_npz}")
-    dataset = Model1Dataset(args.m1_npz, window = cfg["window"], graph_window = cfg["graph_window"])
-    print(f"m1 T = {dataset.T}  samples = {len(dataset)}")
-
-    loader = DataLoader(dataset, batch_size = args.batch_size, shuffle = False,
-                        num_workers = 0, pin_memory = device.type == "cuda")
-
-    print("running inference over full m1 dataset")
-    regime_logits, trans_logits, trend_logits = collect_logits(model, loader, device)
-    n_pred = len(regime_logits)
-    print(f"collected {n_pred} predictions")
-
-    if regime_logits.shape[1] != n_cls:
-        raise ValueError(
-            f"checkpoint produced {regime_logits.shape[1]} regime classes but cfg says "
-            f"n_regime_classes = {n_cls}. checkpoint and cfg are out of sync.")
-
-    m1_packed = pack_m1_out(regime_logits, trans_logits, trend_logits, n_cls, target_dim)
-
-    m1_full = np.load(args.m1_npz)
-    times_full = m1_full["times"].astype(np.int64)
-    sample_to_raw_idx = np.arange(n_pred) + cfg["window"]
-    if sample_to_raw_idx.max() >= len(times_full):
-        raise ValueError(
-            f"sample-to-raw index max {sample_to_raw_idx.max()} >= len(times_full) "
-            f"{len(times_full)}. m1 dataset and inference output are inconsistent.")
-    decision_times = times_full[sample_to_raw_idx]
-
-    aligned, matched = align_to_target_times(decision_times, m1_packed, target_times)
-    coverage = matched / max(1, len(target_times))
-    print(f"alignment matched {matched}/{len(target_times)} ({coverage:.2%})")
-
-    if coverage < args.min_coverage:
-        msg = (f"coverage {coverage:.2%} below threshold {args.min_coverage:.2%}. "
-               f"unmatched rows will be zero-vector m1 inputs at inference.")
-        if not args.allow_low_coverage:
-            raise RuntimeError(msg + "  pass --allow_low_coverage to proceed anyway.")
-        print(f"WARNING {msg}")
-
-    nz_rows = np.abs(aligned).sum(axis = -1) > 0
-    if nz_rows.any():
-        print("per-slot mean over matched rows:")
-        slot_names = [f"regime_p{i}" for i in range(n_cls)] + ["trans_p", "max_conf", "trend_p"]
-        means = aligned[nz_rows].mean(axis = 0)
-        for i in range(target_dim):
-            label = slot_names[i] if i < len(slot_names) else f"pad{i - len(slot_names)}"
-            print(f"  slot[{i:02d}] {label:>12}  {means[i]:+.4f}")
-
-    print(f"writing back to {args.m2_npz}")
-    set_model1_outputs(args.m2_npz, aligned)
-
-    verify = np.load(args.m2_npz)
-    saved = verify["model1_outputs"]
-    if not np.allclose(saved, aligned, atol = 1e-6):
-        max_diff = float(np.abs(saved - aligned).max())
-        raise RuntimeError(
-            f"roundtrip verification failed: written m1_outputs differ from intended "
-            f"(max abs diff = {max_diff:.2e})")
-    nz_saved = int((np.abs(saved).sum(axis = -1) > 0).sum())
-    print(f"roundtrip verified  saved nonzero rows = {nz_saved}/{len(saved)}")
-    print("done")
+def live_inference(model2, dir_model, phase_model, m2_dataset, cfg, prev_position = None):
+    import torch
+    from model2_train import build_trade_decision
+    device = next(model2.parameters()).device
+    sample = m2_dataset.get_current_sample()
+    m1_features = sample.get("model1_outputs", None)
+    if m1_features is None:
+        raise ValueError("model1_outputs not in Model2Dataset sample")
+    m1_out = torch.from_numpy(m1_features).to(device) if isinstance(m1_features, np.ndarray) else m1_features.to(device)
+    with torch.no_grad():
+        out = model2(
+            f4h = sample["features_4h"].to(device),
+            te4h = sample.get("time_enc_4h", torch.zeros(1, 72, 8)).to(device),
+            f15m = sample.get("features_15m", torch.zeros(1, 96, len(ASSETS), 1)).to(device),
+            te15m = sample.get("time_enc_15m", torch.zeros(1, 96, 8)).to(device),
+            f1h = sample.get("features_1h", torch.zeros(1, 48, len(ASSETS), 1)).to(device),
+            te1h = sample.get("time_enc_1h", torch.zeros(1, 48, 8)).to(device),
+            m1_out = m1_out)
+    if prev_position is None:
+        prev_position = np.zeros(len(ASSETS))
+    decision = build_trade_decision(out, prev_position, cfg)
+    m1_vals = m1_out[0].cpu().numpy() if torch.is_tensor(m1_out) else m1_out[0]
+    decision["regime"] = {
+        "direction_prob": float(m1_vals[0]),
+        "phase_prob": float(m1_vals[1]),
+        "direction_confidence": float(m1_vals[2]),
+        "phase_confidence": float(m1_vals[3]),
+        "transition_intensity": float(m1_vals[4]),
+    }
+    bull_prob = (1 - m1_vals[0]) * (1 - m1_vals[1])
+    bear_prob = m1_vals[0] * (1 - m1_vals[1])
+    acc_prob = (1 - m1_vals[0]) * m1_vals[1]
+    dist_prob = m1_vals[0] * m1_vals[1]
+    decision["regime_4class"] = {
+        "bull": float(bull_prob),
+        "bear": float(bear_prob),
+        "accumulating": float(acc_prob),
+        "distributing": float(dist_prob),
+    }
+    return decision
 
 
 if __name__ == "__main__":
-    main()
+    outputs_15m, times_15m, outputs_1h, times_1h = generate_training_outputs()
+    print(f"\nModel1 output stats (15m cadence):")
+    names = ["direction_prob", "phase_prob", "dir_confidence", "phase_confidence", "transition_intensity"]
+    for i, name in enumerate(names):
+        col = outputs_15m[:, i]
+        print(f"  {name}: mean={col.mean():.3f}  std={col.std():.3f}  min={col.min():.3f}  max={col.max():.3f}")

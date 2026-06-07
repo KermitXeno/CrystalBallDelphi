@@ -1,10 +1,41 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model1_layers import GRN, CausalConv1d
+
+
+class GRN(nn.Module):
+
+    def __init__(self, d_in, d_out, d_ctx = None, dropout = 0.1):
+        super().__init__()
+        self.proj_skip = nn.Linear(d_in, d_out, bias = False) if d_in != d_out else nn.Identity()
+        ctx_dim = d_ctx or 0
+        self.fc_hidden = nn.Linear(d_in + ctx_dim, d_out)
+        self.fc_gate = nn.Linear(d_in + ctx_dim, d_out)
+        nn.init.constant_(self.fc_gate.bias, -2.0)
+        self.norm = nn.LayerNorm(d_out)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, ctx = None):
+        h = torch.cat([x, ctx], dim = -1) if ctx is not None else x
+        gate = torch.sigmoid(self.fc_gate(h))
+        act = F.elu(self.fc_hidden(h))
+        return self.norm(self.proj_skip(x) + self.drop(gate * act))
+
+
+class CausalConv1d(nn.Module):
+
+    def __init__(self, d_in, d_out, kernel_size, dilation = 1):
+        super().__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(d_in, d_out, kernel_size, dilation = dilation)
+
+    def forward(self, x):
+        x = F.pad(x, (self.pad, 0))
+        return self.conv(x)
 
 
 class SubHourlyEncoder(nn.Module):
+
     def __init__(self, F_in, D_time, d_out, dropout = 0.1):
         super().__init__()
         self.proj = nn.Linear(F_in + D_time, d_out)
@@ -29,6 +60,7 @@ class SubHourlyEncoder(nn.Module):
 
 
 class AssetTemporalEncoder(nn.Module):
+
     def __init__(self, F_in, D_time, d_model = 32, d_lstm = 32, dropout = 0.1):
         super().__init__()
         self.proj = nn.Linear(F_in + D_time, d_model)
@@ -64,8 +96,33 @@ class AssetTemporalEncoder(nn.Module):
         return out, recent
 
 
+class DynamicAdjacency(nn.Module):
+
+    def __init__(self, N, n_heads, d_node, d_regime, dropout = 0.1, init_scale = 0.1):
+        super().__init__()
+        self.base_adj = nn.Parameter(torch.randn(n_heads, N, N) * init_scale)
+        self.node_key = nn.Linear(d_node, n_heads, bias = False)
+        self.regime_proj = nn.Linear(d_regime, n_heads, bias = False)
+        self.drop = nn.Dropout(dropout)
+        self.n_heads = n_heads
+        nn.init.zeros_(self.node_key.weight)
+        nn.init.zeros_(self.regime_proj.weight)
+
+    def forward(self, h, regime_ctx = None):
+        nk = self.node_key(h)
+        mod_i = nk.unsqueeze(2)
+        mod_j = nk.unsqueeze(1)
+        dynamic = (mod_i + mod_j).permute(0, 3, 1, 2)
+        bias = self.base_adj.unsqueeze(0) + dynamic
+        if regime_ctx is not None:
+            r = self.regime_proj(regime_ctx)
+            bias = bias + r.unsqueeze(-1).unsqueeze(-1)
+        return self.drop(bias)
+
+
 class CrossAssetAttention(nn.Module):
-    def __init__(self, d_in, d_out, n_heads = 4, dropout = 0.1):
+
+    def __init__(self, d_in, d_out, N, n_heads = 4, d_regime = 5, dropout = 0.1):
         super().__init__()
         assert d_out % n_heads == 0
         self.n_heads = n_heads
@@ -75,20 +132,23 @@ class CrossAssetAttention(nn.Module):
         self.W_k = nn.Linear(d_in, d_out, bias = False)
         self.W_v = nn.Linear(d_in, d_out, bias = False)
         self.W_o = nn.Linear(d_out, d_out)
+        self.adj = DynamicAdjacency(N, n_heads, d_in, d_regime, dropout = dropout)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, regime_ctx = None):
         B, N, _ = x.shape
         Q = self.W_q(x).view(B, N, self.n_heads, self.d_head).transpose(1, 2)
         K = self.W_k(x).view(B, N, self.n_heads, self.d_head).transpose(1, 2)
         V = self.W_v(x).view(B, N, self.n_heads, self.d_head).transpose(1, 2)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        edge_bias = self.adj(x, regime_ctx)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale + edge_bias
         attn = self.drop(F.softmax(scores, dim = -1))
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, N, -1)
         return self.W_o(out)
 
 
 class TemporalCrossAssetAttention(nn.Module):
+
     def __init__(self, d_in, d_out, n_heads = 4, dropout = 0.1):
         super().__init__()
         assert d_out % n_heads == 0
@@ -119,89 +179,94 @@ class TemporalCrossAssetAttention(nn.Module):
 
 
 class RegimeFiLM(nn.Module):
+
     def __init__(self, d_ctx, d_feat):
         super().__init__()
-        self.to_scale = nn.Linear(d_ctx, d_feat)
-        self.to_shift = nn.Linear(d_ctx, d_feat)
+        self.proj = nn.Linear(d_ctx, d_ctx * 2)
+        self.to_scale = nn.Linear(d_ctx * 2, d_feat)
+        self.to_shift = nn.Linear(d_ctx * 2, d_feat)
         nn.init.zeros_(self.to_scale.weight)
         nn.init.zeros_(self.to_scale.bias)
         nn.init.zeros_(self.to_shift.weight)
         nn.init.zeros_(self.to_shift.bias)
 
     def forward(self, x, ctx):
-        s = self.to_scale(ctx).unsqueeze(1)
-        b = self.to_shift(ctx).unsqueeze(1)
+        h = F.gelu(self.proj(ctx))
+        s = self.to_scale(h).unsqueeze(1)
+        b = self.to_shift(h).unsqueeze(1)
         return x * (1.0 + s) + b
 
 
-class DavisNormanHead(nn.Module):
-    def __init__(self, d_enc, F_char, d_ctx, d_target = 48, d_gate = 24, dropout = 0.15,
-                 band_init = 0.05, band_min = 0.005, band_max = 0.30, sharpness = 30.0):
+
+class ReturnPredictionHead(nn.Module):
+
+    def __init__(self, d_enc, d_ctx, d_hidden = 48, dropout = 0.15):
         super().__init__()
-        self.target_net = nn.Sequential(
-            nn.Linear(d_enc + F_char, d_target),
+        d_in = d_enc + d_ctx
+        self.return_net = nn.Sequential(
+            nn.Linear(d_in, d_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_target, d_target // 2),
+            nn.Linear(d_hidden, d_hidden // 2),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_target // 2, 1))
-        self.band_net = nn.Sequential(
-            nn.Linear(d_enc + F_char, d_target // 2),
+            nn.Linear(d_hidden // 2, 1))
+        self.logvar_net = nn.Sequential(
+            nn.Linear(d_in, d_hidden // 2),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_target // 2, 1))
-        self.gate_net = nn.Sequential(
-            nn.Linear(d_enc + d_ctx, d_gate),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_gate, 1))
-        self.log_temp = nn.Parameter(torch.tensor(0.5).log())
-        self.register_buffer("inv_vol_prior", torch.zeros(1))
-        self.band_min = band_min
-        self.band_max = band_max
-        self.band_init = band_init
-        self.sharpness = sharpness
+            nn.Linear(d_hidden // 2, 1))
+        nn.init.zeros_(self.return_net[-1].weight)
+        nn.init.zeros_(self.return_net[-1].bias)
+        nn.init.constant_(self.logvar_net[-1].bias, -2.0)
 
-    def set_inv_vol_prior(self, asset_vol):
-        inv_vol = 1.0 / asset_vol.clamp(min = 1e-6)
-        log_prior = inv_vol.log()
-        prior = (log_prior - log_prior.mean()).to(self.inv_vol_prior.device)
-        self.inv_vol_prior = prior.detach()
-
-    def forward(self, h_per_asset, chars, m1_out):
+    def forward(self, h_per_asset, regime_ctx):
         B, N, D = h_per_asset.shape
-        ta_in = torch.cat([h_per_asset, chars], dim = -1)
-        ta_flat = ta_in.reshape(B * N, -1)
-        a = self.target_net(ta_flat).squeeze(-1).view(B, N)
-        a = a + self.inv_vol_prior
-        temp = self.log_temp.exp().clamp(min = 0.25, max = 8.0)
-        target = F.softmax(a / temp, dim = -1)
-        band_raw = self.band_net(ta_flat).squeeze(-1).view(B, N)
-        band = self.band_min + (self.band_max - self.band_min) * torch.sigmoid(band_raw)
-        pooled = h_per_asset.mean(dim = 1)
-        ctx_in = torch.cat([pooled, m1_out], dim = -1)
-        gate = torch.sigmoid(self.gate_net(ctx_in)).squeeze(-1)
-        return target, gate, band, a
+        ctx = regime_ctx.unsqueeze(1).expand(-1, N, -1)
+        inp = torch.cat([h_per_asset, ctx], dim = -1)
+        flat = inp.reshape(B * N, -1)
+        pred_ret = self.return_net(flat).view(B, N)
+        log_var = self.logvar_net(flat).view(B, N)
+        return pred_ret, log_var
+
+
+class PortfolioConstructor:
+
+    def __init__(self, cost_rate = 0.0015, gate_sensitivity = 12.0):
+        self.cost_rate = cost_rate
+        self.gate_sensitivity = gate_sensitivity
+
+    def construct(self, pred_returns, log_var, regime_ctx, prev_weights = None):
+        direction_prob = regime_ctx[:, 0:1]
+        dir_confidence = regime_ctx[:, 2:3]
+        transition_intensity = regime_ctx[:, 4:5]
+        bull_signal = (0.5 - direction_prob) * dir_confidence * (1.0 - transition_intensity * 0.5)
+        gate = torch.sigmoid(bull_signal * self.gate_sensitivity)
+        precision = (-log_var).exp().clamp(max = 100.0)
+        alpha = pred_returns * precision
+        pos_alpha = F.relu(alpha)
+        denom = pos_alpha.sum(dim = -1, keepdim = True) + 1e-8
+        raw_w = pos_alpha / denom
+        target = raw_w * gate
+        if prev_weights is not None:
+            delta = target - prev_weights
+            expected_gain = (delta * pred_returns).abs()
+            cost = delta.abs() * self.cost_rate
+            skip = (expected_gain < cost).float()
+            target = prev_weights + delta * (1.0 - skip)
+        return target, gate.squeeze(-1)
 
 
 class Model2(nn.Module):
-    def __init__(self,
-                 F_1h, F_15m, F_30m,
-                 D_time_1h, D_time_15m, D_time_30m,
-                 N_assets = 20, d_regime = 6,
-                 d_model = 32, d_lstm = 32, d_cross = 48,
-                 n_cross_heads = 4, dropout = 0.12,
-                 embed_drop = 0.5, band_sharpness = 30.0,
-                 t_recent = 4):
+
+    def __init__(self, F_4h, F_15m, F_1h, D_time_4h, D_time_15m, D_time_1h,
+                 N_assets = 20, d_regime = 5, d_model = 32, d_lstm = 32, d_cross = 48,
+                 n_cross_heads = 4, dropout = 0.12, embed_drop = 0.5, t_recent = 4):
         super().__init__()
         self.N = N_assets
         self.embed_drop = embed_drop
-        self.band_sharpness = band_sharpness
         self.t_recent = t_recent
-        self.enc_1h = AssetTemporalEncoder(F_1h, D_time_1h, d_model = d_model, d_lstm = d_lstm, dropout = dropout)
+        self.enc_4h = AssetTemporalEncoder(F_4h, D_time_4h, d_model = d_model, d_lstm = d_lstm, dropout = dropout)
         self.enc_15m = SubHourlyEncoder(F_15m, D_time_15m, d_model, dropout = dropout)
-        self.enc_30m = SubHourlyEncoder(F_30m, D_time_30m, d_model, dropout = dropout)
+        self.enc_1h = SubHourlyEncoder(F_1h, D_time_1h, d_model, dropout = dropout)
         self.temporal_xa = TemporalCrossAssetAttention(d_lstm, d_lstm, n_heads = n_cross_heads, dropout = dropout)
         self.temporal_xa_norm = nn.LayerNorm(d_lstm)
         d_fuse = d_lstm + d_model * 2
@@ -212,20 +277,20 @@ class Model2(nn.Module):
             nn.Dropout(dropout))
         self.asset_embed = nn.Parameter(torch.randn(N_assets, d_cross) * 0.10)
         self.film = RegimeFiLM(d_regime, d_cross)
-        self.cross_attn = CrossAssetAttention(d_cross, d_cross, n_heads = n_cross_heads, dropout = dropout)
+        self.cross_attn = CrossAssetAttention(d_cross, d_cross, N_assets, n_heads = n_cross_heads, d_regime = d_regime, dropout = dropout)
         self.attn_norm = nn.LayerNorm(d_cross)
         self.ffn = GRN(d_cross, d_cross, dropout = dropout)
         self.ffn_norm = nn.LayerNorm(d_cross)
-        self.alloc = DavisNormanHead(d_enc = d_cross, F_char = F_1h, d_ctx = d_regime, dropout = dropout)
+        self.pred_head = ReturnPredictionHead(d_enc = d_cross, d_ctx = d_regime, dropout = dropout)
 
-    def forward(self, f1h, te1h, f15m, te15m, f30m, te30m, m1_out):
-        B = f1h.shape[0]
+    def forward(self, f4h, te4h, f15m, te15m, f1h, te1h, m1_out):
+        B = f4h.shape[0]
         N = self.N
-        h_1h, recent_1h = self.enc_1h(f1h, te1h, t_recent = self.t_recent)
+        h_4h, recent_4h = self.enc_4h(f4h, te4h, t_recent = self.t_recent)
         h_15m = self.enc_15m(f15m, te15m)
-        h_30m = self.enc_30m(f30m, te30m)
-        h_1h = self.temporal_xa_norm(h_1h + self.temporal_xa(recent_1h))
-        h = self.asset_fuse(torch.cat([h_1h, h_15m, h_30m], dim = -1))
+        h_1h = self.enc_1h(f1h, te1h)
+        h_4h = self.temporal_xa_norm(h_4h + self.temporal_xa(recent_4h))
+        h = self.asset_fuse(torch.cat([h_4h, h_15m, h_1h], dim = -1))
         if self.training and self.embed_drop > 0:
             keep = 1.0 - self.embed_drop
             mask = torch.bernoulli(torch.full((N,), keep, device = h.device))
@@ -233,8 +298,7 @@ class Model2(nn.Module):
         else:
             h = h + self.asset_embed[None, :, :]
         h = self.film(h, m1_out)
-        h = self.attn_norm(h + self.cross_attn(h))
+        h = self.attn_norm(h + self.cross_attn(h, regime_ctx = m1_out))
         h = self.ffn_norm(h + self.ffn(h))
-        chars = f1h[:, -1, :, :]
-        target, gate, band, logits = self.alloc(h, chars, m1_out)
-        return {"target": target, "gate": gate, "band": band, "logits": logits}
+        pred_ret, log_var = self.pred_head(h, m1_out)
+        return {"pred_ret": pred_ret, "log_var": log_var}

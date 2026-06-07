@@ -1,27 +1,31 @@
-import os, sys, time, argparse
+import os
+import sys
+import time
+import math
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model2_layers import Model2
-from dp_download import BASE_DIR
-from ds_struc_wstg import Model2Dataset, ASSETS, BTC_IDX
+from model2_layers import Model2, PortfolioConstructor
+from ds_struc_wstg import Model2Dataset, ASSETS, BTC_IDX, BASE_DIR
 
 DEFAULT_CFG = {
     "N": 20,
-    "F_1h": None,
+    "F_4h": None,
     "F_15m": None,
-    "F_30m": None,
-    "D_time_1h": None,
+    "F_1h": None,
+    "D_time_4h": None,
     "D_time_15m": None,
-    "D_time_30m": None,
-    "seq_len_1h": 72,
+    "D_time_1h": None,
+    "seq_len_4h": 72,
     "seq_k": 8,
     "lookback_15m": 96,
-    "lookback_30m": 48,
-    "train_stride": 4,
-    "d_regime": 6,
+    "lookback_1h": 48,
+    "train_stride": 1,
+    "d_regime": 5,
     "d_model": 32,
     "d_lstm": 32,
     "d_cross": 48,
@@ -29,422 +33,374 @@ DEFAULT_CFG = {
     "t_recent": 4,
     "dropout": 0.12,
     "embed_drop": 0.5,
-    "band_sharpness": 30.0,
     "lr": 3e-4,
     "weight_decay": 1e-4,
     "batch_size": 32,
     "epochs": 40,
     "grad_clip": 1.0,
-    "warmup_epochs": 4,
+    "warmup_epochs": 3,
     "warmup_start_factor": 0.1,
     "scheduler_eta_min": 3e-5,
     "patience": 15,
-    "fee_rate": 0.001,
-    "slippage_rate": 0.0005,
+    "temporal_ic_coef": 1.5,
+    "xs_ic_coef": 0.3,
+    "nll_coef": 0.5,
+    "directional_coef": 0.3,
+    "cost_rate": 0.0015,
     "btc_idx": BTC_IDX,
-    "conc_coef": 0.25,
-    "max_w_coef": 0.5,
-    "dd_coef": 0.08,
-    "logit_reg_coef": 0.005,
-    "max_weight": 0.4,
-    "max_hhi": 0.3,
-    "band_reg_coef": 0.02,
-    "band_target": 0.05,
-    "trade_q_coef": 5.0,
-    "trade_q_min_delta": 0.005,
-    "trade_q_fwd_horizon": 4,
-    "trade_q_fwd_decay": 0.7,
-    "trade_q_loss_aversion": 1.5,
-    "regime_gross_coef": 0.5,
-    "bull_gross_target": 0.55,
-    "bear_gross_target": 0.10,
-    "neutral_gross_target": 0.30,
-    "inactivity_coef": 10.0,
-    "min_turnover": 0.05,
-    "cost_ramp_start_epoch": 5,
-    "cost_ramp_end_epoch": 25,
-    "cost_start_fraction": 0.15,
-    "ir_var_floor": 1e-4,
-    "ir_clip": 50.0,
     "skip_nan_batches": True,
     "log_every_n_batches": 25,
 }
 
-def _flatten_bk(t):
-    return t.reshape(t.shape[0] * t.shape[1], *t.shape[2:])
 
-def compute_cost_rate(epoch, cfg):
-    full = cfg["fee_rate"] + cfg["slippage_rate"]
-    s, e, sf = cfg["cost_ramp_start_epoch"], cfg["cost_ramp_end_epoch"], cfg["cost_start_fraction"]
-    if epoch < s:
-        frac = sf
-    elif epoch >= e:
-        frac = 1.0
-    else:
-        frac = sf + (1.0 - sf) * (epoch - s) / max(e - s, 1)
-    return full * frac, frac
+def temporal_ic_loss(pred, actual):
+    pred_dm = pred - pred.mean(dim = 1, keepdim = True)
+    actual_dm = actual - actual.mean(dim = 1, keepdim = True)
+    cov = (pred_dm * actual_dm).sum(dim = 1)
+    std_p = (pred_dm.pow(2).sum(dim = 1) + 1e-8).sqrt()
+    std_a = (actual_dm.pow(2).sum(dim = 1) + 1e-8).sqrt()
+    ic_per_asset = cov / (std_p * std_a + 1e-8)
+    return -ic_per_asset.mean(), ic_per_asset.mean().item()
 
-def davis_norman_step(prev, target, band, gate, sharpness, max_weight):
-    aim = gate.unsqueeze(-1) * target
-    deviation = prev - aim
-    abs_dev = deviation.abs()
-    excess = abs_dev - band
-    update_strength = torch.sigmoid(sharpness * excess)
-    snap_target = aim + torch.sign(deviation) * band
-    snap_target = snap_target.clamp(min = 0.0, max = max_weight)
-    new_pos = prev + update_strength * (snap_target - prev)
-    return new_pos.clamp(min = 0.0, max = max_weight)
 
-def portfolio_loss(target, gate, band, logits, ret_next, dd_next, m1_out, cfg, cost_rate = None):
-    if cost_rate is None:
-        cost_rate = cfg["fee_rate"] + cfg["slippage_rate"]
-    B, K, N = target.shape
-    sharpness = cfg["band_sharpness"]
-    max_w = cfg["max_weight"]
-    pos_list = []
-    prev = target.new_zeros(B, N)
-    for t in range(K):
-        pos_t = davis_norman_step(prev, target[:, t], band[:, t], gate[:, t], sharpness, max_w)
-        pos_list.append(pos_t)
-        prev = pos_t
-    positions = torch.stack(pos_list, dim = 1)
-    prev_pos = torch.cat([target.new_zeros(B, 1, N), positions[:, :-1]], dim = 1)
-    delta_pos = positions - prev_pos
-    turnover = delta_pos.abs().sum(dim = -1)
-    gross_ret = (positions * ret_next).sum(dim = -1)
-    port_ret = gross_ret - cost_rate * turnover
-    bench_weights = cfg["bench_weights"]
-    bench_ret = (ret_next * bench_weights).sum(dim = -1)
-    excess = port_ret - bench_ret
-    mean_ex = excess.mean()
-    std_ex = (excess.var(unbiased = False) + cfg["ir_var_floor"]).sqrt()
-    ir = (mean_ex / std_ex).clamp(-cfg["ir_clip"], cfg["ir_clip"])
-    btc_ret = ret_next[..., cfg["btc_idx"]]
-    trade_q_min = cfg["trade_q_min_delta"]
-    traded_mask = (delta_pos.abs() > trade_q_min).float()
-    fwd_horizon = cfg["trade_q_fwd_horizon"]
-    fwd_returns = ret_next.clone()
-    for h in range(1, fwd_horizon):
-        shifted = torch.zeros_like(ret_next)
-        if K - h > 0:
-            shifted[:, :K - h] = ret_next[:, h:]
-        fwd_returns = fwd_returns + shifted * (cfg["trade_q_fwd_decay"] ** h)
-    is_buy = (delta_pos > 0).float()
-    is_sell = (delta_pos < 0).float()
-    asym_loss_w = cfg["trade_q_loss_aversion"]
-    buy_pnl = (delta_pos * fwd_returns * traded_mask * is_buy).sum(dim = -1)
-    sell_pnl_raw = (delta_pos * fwd_returns * traded_mask * is_sell).sum(dim = -1)
-    sell_loss_avoided = F.relu(-sell_pnl_raw) * (asym_loss_w - 1.0)
-    trade_pnl = buy_pnl + sell_pnl_raw + sell_loss_avoided
-    trade_volume = (delta_pos.abs() * traded_mask).sum(dim = -1).clamp(min = 1e-6)
-    trade_quality = (trade_pnl / trade_volume).mean()
-    gross = positions.sum(dim = -1)
-    hhi = (positions ** 2).sum(dim = -1)
-    dd_term = (positions * dd_next).sum(dim = -1).mean()
-    conc_term = F.relu(hhi - cfg["max_hhi"]).mean()
-    maxw_term = F.relu(positions - cfg["max_weight"]).sum(dim = -1).mean()
-    band_reg = (band - cfg["band_target"]).pow(2).mean()
-    mean_turnover = turnover.mean()
-    inactivity_pen = F.relu(cfg["min_turnover"] - mean_turnover)
-    bull_target = cfg["bull_gross_target"]
-    bear_target = cfg["bear_gross_target"]
-    bull_prob = m1_out[..., 0]
-    bear_prob = m1_out[..., 1]
-    sideways_prob = (1.0 - bull_prob - bear_prob).clamp(min = 0.0, max = 1.0)
-    desired_gross = (bull_prob * bull_target
-                     + bear_prob * bear_target
-                     + sideways_prob * cfg["neutral_gross_target"])
-    regime_gross_pen = (gross - desired_gross).pow(2).mean()
-    loss = (-ir
-            - cfg["trade_q_coef"] * trade_quality
-            - cfg["dd_coef"] * dd_term
-            + cfg["conc_coef"] * conc_term
-            + cfg["max_w_coef"] * maxw_term
-            + cfg["logit_reg_coef"] * logits.pow(2).mean()
-            + cfg["band_reg_coef"] * band_reg
-            + cfg["inactivity_coef"] * inactivity_pen
-            + cfg["regime_gross_coef"] * regime_gross_pen)
-    if not torch.isfinite(loss):
-        raise RuntimeError(f"non-finite loss ir={ir.item()}")
-    per_asset = positions.detach().float().mean(dim = (0, 1)).cpu().numpy()
-    n_trades = traded_mask.sum().item() / max(B, 1)
-    n_buys = (is_buy * traded_mask).sum().item() / max(B, 1)
-    n_sells = (is_sell * traded_mask).sum().item() / max(B, 1)
+def xs_ic_loss(pred, actual):
+    pred_dm = pred - pred.mean(dim = -1, keepdim = True)
+    actual_dm = actual - actual.mean(dim = -1, keepdim = True)
+    cov = (pred_dm * actual_dm).sum(dim = -1)
+    std_p = (pred_dm.pow(2).sum(dim = -1) + 1e-8).sqrt()
+    std_a = (actual_dm.pow(2).sum(dim = -1) + 1e-8).sqrt()
+    ic = cov / (std_p * std_a + 1e-8)
+    return -ic.mean(), ic.mean().item()
+
+
+def gaussian_nll_loss(pred, actual, log_var):
+    var = log_var.exp().clamp(min = 1e-6, max = 10.0)
+    nll = 0.5 * (log_var + (pred - actual).pow(2) / var)
+    return nll.mean()
+
+
+def directional_loss(pred, actual):
+    correct = (pred.sign() == actual.sign()).float()
+    confidence = pred.abs()
+    wrong_confident = (1.0 - correct) * confidence
+    return wrong_confident.mean()
+
+
+def compute_prediction_loss(pred_ret, log_var, actual_ret, cfg):
+    t_ic_l, t_ic_val = temporal_ic_loss(pred_ret, actual_ret)
+    xs_ic_l, xs_ic_val = xs_ic_loss(
+        pred_ret.reshape(-1, pred_ret.shape[-1]),
+        actual_ret.reshape(-1, actual_ret.shape[-1]))
+    nll_l = gaussian_nll_loss(
+        pred_ret.reshape(-1, pred_ret.shape[-1]),
+        actual_ret.reshape(-1, actual_ret.shape[-1]),
+        log_var.reshape(-1, log_var.shape[-1]))
+    dir_l = directional_loss(
+        pred_ret.reshape(-1, pred_ret.shape[-1]),
+        actual_ret.reshape(-1, actual_ret.shape[-1]))
+    loss = (cfg["temporal_ic_coef"] * t_ic_l
+            + cfg["xs_ic_coef"] * xs_ic_l
+            + cfg["nll_coef"] * nll_l
+            + cfg["directional_coef"] * dir_l)
+    flat_pred = pred_ret.reshape(-1, pred_ret.shape[-1])
+    flat_actual = actual_ret.reshape(-1, actual_ret.shape[-1])
+    dir_acc = (flat_pred.sign() == flat_actual.sign()).float().mean().item()
     return loss, {
-        "ir": ir.item(), "trade_q": trade_quality.item(),
-        "buy_pnl": buy_pnl.mean().item(), "sell_pnl": sell_pnl_raw.mean().item(),
-        "net_ret": port_ret.mean().item(),
-        "btc_ret": btc_ret.mean().item(), "bench_ret": bench_ret.mean().item(),
-        "excess_ret": mean_ex.item(),
-        "excess_vs_btc": (port_ret - btc_ret).mean().item(),
-        "cost": (cost_rate * turnover).mean().item(), "turnover": turnover.mean().item(),
-        "gross": gross.mean().item(), "cash": (1.0 - gross).mean().item(),
-        "desired_gross": desired_gross.mean().item(),
-        "gate": gate.mean().item(), "band": band.mean().item(),
-        "n_trades": n_trades, "n_buys": n_buys, "n_sells": n_sells,
-        "dd": dd_term.item(),
-        "max_w": positions.max().item(), "per_asset": per_asset,
+        "t_ic": t_ic_val,
+        "xs_ic": xs_ic_val,
+        "nll": nll_l.item(),
+        "dir_acc": dir_acc,
+        "pred_std": pred_ret.std().item(),
+        "log_var_mean": log_var.mean().item(),
     }
 
-def _forward_batch(model, batch, device):
-    for k in batch:
-        batch[k] = batch[k].to(device, non_blocking = True)
-    B, K = batch["features_1h"].shape[:2]
+
+def portfolio_metrics(pred_ret, log_var, actual_ret, regime_ctx, cfg):
+    constructor = PortfolioConstructor(cost_rate = cfg["cost_rate"])
+    with torch.no_grad():
+        weights, gate = constructor.construct(pred_ret, log_var, regime_ctx)
+        port_ret = (weights * actual_ret).sum(dim = -1)
+        gross = weights.sum(dim = -1)
+        btc_ret = actual_ret[..., cfg["btc_idx"]]
+        inv_vol = torch.ones(cfg["N"], device = pred_ret.device) / cfg["N"]
+        bench_ret = (actual_ret * inv_vol).sum(dim = -1)
+        max_w = weights.max().item()
+        concentration = (weights ** 2).sum(dim = -1).mean().item()
+        mean_pred = pred_ret.mean(dim = 0).cpu().numpy()
+        n_bullish = (pred_ret > 0).float().mean(dim = 0).cpu().numpy()
+        pred_correct = ((pred_ret > 0) == (actual_ret > 0)).float().mean().item()
+    return {
+        "port_ret": port_ret.mean().item(),
+        "bench_ret": bench_ret.mean().item(),
+        "btc_ret": btc_ret.mean().item(),
+        "excess_ret": (port_ret - bench_ret).mean().item(),
+        "gross": gross.mean().item(),
+        "gate_mean": gate.mean().item(),
+        "gate_min": gate.min().item(),
+        "gate_max": gate.max().item(),
+        "max_w": max_w,
+        "hhi": concentration,
+        "weights": weights.detach().float().mean(dim = 0).cpu().numpy(),
+        "mean_pred": mean_pred,
+        "n_bullish": n_bullish,
+        "pred_correct": pred_correct,
+    }
+
+
+def _flatten_bk(x):
+    if x.dim() == 5:
+        B, K, T, N, F = x.shape
+        return x.reshape(B * K, T, N, F)
+    if x.dim() == 4:
+        B, K, T, D = x.shape
+        return x.reshape(B * K, T, D)
+    if x.dim() == 3:
+        B, K, D = x.shape
+        return x.reshape(B * K, D)
+    return x
+
+
+def _run_batch(model, batch, cfg):
+    B = batch["features_4h"].shape[0]
+    K = batch["features_4h"].shape[1]
     out = model(
-        f1h = _flatten_bk(batch["features_1h"]),
-        te1h = _flatten_bk(batch["time_enc_1h"]),
+        f4h = _flatten_bk(batch["features_4h"]),
+        te4h = _flatten_bk(batch["time_enc_4h"]),
         f15m = _flatten_bk(batch["features_15m"]),
         te15m = _flatten_bk(batch["time_enc_15m"]),
-        f30m = _flatten_bk(batch["features_30m"]),
-        te30m = _flatten_bk(batch["time_enc_30m"]),
+        f1h = _flatten_bk(batch["features_1h"]),
+        te1h = _flatten_bk(batch["time_enc_1h"]),
         m1_out = _flatten_bk(batch["model1_outputs"]))
-    return (out["target"].view(B, K, -1), out["gate"].view(B, K), out["band"].view(B, K, -1),
-            out["logits"].view(B, K, -1), batch["targets"][..., 0], batch["targets"][..., 2],
-            batch["model1_outputs"])
+    pred_ret = out["pred_ret"].view(B, K, -1)
+    log_var = out["log_var"].view(B, K, -1)
+    actual_ret = batch["targets"][..., 0]
+    loss, stats = compute_prediction_loss(pred_ret, log_var, actual_ret, cfg)
+    m1_flat = _flatten_bk(batch["model1_outputs"])
+    pred_flat = pred_ret.reshape(B * K, -1)
+    logvar_flat = log_var.reshape(B * K, -1)
+    actual_flat = actual_ret.reshape(B * K, -1)
+    port = portfolio_metrics(pred_flat, logvar_flat, actual_flat, m1_flat, cfg)
+    stats.update(port)
+    return loss, stats
 
-def _acc(tot, new):
-    for k, v in new.items():
-        if k == "per_asset":
-            tot[k] = tot.get(k, np.zeros_like(v)) + v
-        else:
-            tot[k] = tot.get(k, 0.0) + v
 
-def _avg(tot, n):
-    d = max(n, 1)
-    return {k: v / d for k, v in tot.items()}
 
-def train_epoch(model, loader, optimizer, device, cfg, epoch = None):
+def _fmt_top(arr, names, n = 5):
+    top = np.argsort(arr)[::-1][:n]
+    return " ".join(f"{names[i].replace('USDT','')}:{arr[i]:.1%}" for i in top if arr[i] > 0.001)
+
+
+def _fmt_signals(mean_pred, names, n = 3):
+    order = np.argsort(mean_pred)
+    buys = [i for i in order[::-1][:n] if mean_pred[i] > 0]
+    sells = [i for i in order[:n] if mean_pred[i] < 0]
+    buy_str = " ".join(f"{names[i].replace('USDT','')} {mean_pred[i]:+.3%}" for i in buys)
+    sell_str = " ".join(f"{names[i].replace('USDT','')} {mean_pred[i]:+.3%}" for i in sells)
+    return buy_str or "none", sell_str or "none"
+
+
+def train_epoch(model, loader, optimizer, cfg, epoch, device):
     model.train()
-    tot_loss, tot_stats, n, n_skip = 0.0, {}, 0, 0
-    cost_rate, cost_frac = compute_cost_rate(epoch, cfg)
+    tot_loss = 0.0
+    tot_stats = {}
+    n = 0
     t0 = time.time()
     for bi, batch in enumerate(loader):
-        optimizer.zero_grad(set_to_none = True)
+        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
         try:
-            tgt, gate, band, logits, ret_n, dd_n, m1 = _forward_batch(model, batch, device)
-            loss, stats = portfolio_loss(tgt, gate, band, logits, ret_n, dd_n, m1, cfg, cost_rate)
-            loss.backward()
-            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-            if not torch.isfinite(gn):
-                raise RuntimeError("non-finite grad")
-            optimizer.step()
+            loss, stats = _run_batch(model, batch, cfg)
         except RuntimeError as e:
             if cfg["skip_nan_batches"] and "non-finite" in str(e):
-                n_skip += 1
-                optimizer.zero_grad(set_to_none = True)
-                if n_skip > max(20, len(loader) // 4):
-                    raise
                 continue
             raise
+        if not torch.isfinite(loss):
+            continue
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+        optimizer.step()
         tot_loss += loss.item()
-        _acc(tot_stats, stats)
+        for k, v in stats.items():
+            if isinstance(v, (int, float)):
+                tot_stats[k] = tot_stats.get(k, 0) + v
         n += 1
-        lev = cfg["log_every_n_batches"]
-        if lev > 0 and (bi + 1) % lev == 0:
-            el = time.time() - t0
-            its = (bi + 1) / max(el, 1e-6)
-            print(f"  Ep {epoch:03d} step {bi+1:03d}/{len(loader)} "
-                  f"loss {tot_loss/max(n,1):.4f} ir={tot_stats['ir']/max(n,1):+.3f} "
-                  f"tq={tot_stats['trade_q']/max(n,1):+.4f} grs={tot_stats['gross']/max(n,1):+.3f} "
-                  f"gate={tot_stats['gate']/max(n,1):.3f} band={tot_stats['band']/max(n,1):.3f} "
-                  f"cost={cost_rate*1e4:.1f}bps({cost_frac*100:.0f}%) {its:.1f}it/s", flush = True)
-    avg = _avg(tot_stats, n)
-    avg["cost_rate"] = cost_rate
-    avg["cost_frac"] = cost_frac
+        if (bi + 1) % cfg["log_every_n_batches"] == 0:
+            its = (bi + 1) / (time.time() - t0)
+            print(f"    step {bi+1:03d}/{len(loader)}"
+                  f"  loss={tot_loss/max(n,1):.3f}"
+                  f"  timing={tot_stats['t_ic']/max(n,1):+.3f}"
+                  f"  direction={tot_stats['dir_acc']/max(n,1):.1%}"
+                  f"  exposure={tot_stats['gross']/max(n,1):.1%}"
+                  f"  {its:.1f}it/s", flush = True)
+    avg = {k: v / max(n, 1) for k, v in tot_stats.items() if isinstance(v, (int, float))}
     return tot_loss / max(n, 1), avg
 
+
 @torch.no_grad()
-def eval_epoch(model, loader, device, cfg):
+def eval_epoch(model, loader, cfg, device):
     model.eval()
-    tot_loss, tot_stats, n = 0.0, {}, 0
-    full_cost = cfg["fee_rate"] + cfg["slippage_rate"]
+    tot_loss = 0.0
+    tot_stats = {}
+    gate_mins, gate_maxs = [], []
+    all_weights, all_preds, all_bullish = [], [], []
+    n = 0
     for batch in loader:
-        tgt, gate, band, logits, ret_n, dd_n, m1 = _forward_batch(model, batch, device)
-        loss, stats = portfolio_loss(tgt, gate, band, logits, ret_n, dd_n, m1, cfg, full_cost)
+        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        loss, stats = _run_batch(model, batch, cfg)
+        if not torch.isfinite(loss):
+            continue
         tot_loss += loss.item()
-        _acc(tot_stats, stats)
+        for k, v in stats.items():
+            if isinstance(v, (int, float)):
+                tot_stats[k] = tot_stats.get(k, 0) + v
+            elif k == "weights":
+                all_weights.append(v)
+            elif k == "mean_pred":
+                all_preds.append(v)
+            elif k == "n_bullish":
+                all_bullish.append(v)
+        if "gate_min" in stats:
+            gate_mins.append(stats["gate_min"])
+        if "gate_max" in stats:
+            gate_maxs.append(stats["gate_max"])
         n += 1
-    return tot_loss / max(n, 1), _avg(tot_stats, n)
+    avg = {k: v / max(n, 1) for k, v in tot_stats.items() if isinstance(v, (int, float))}
+    avg["per_asset"] = np.mean(all_weights, axis = 0) if all_weights else np.zeros(cfg["N"])
+    avg["mean_pred"] = np.mean(all_preds, axis = 0) if all_preds else np.zeros(cfg["N"])
+    avg["n_bullish"] = np.mean(all_bullish, axis = 0) if all_bullish else np.zeros(cfg["N"])
+    avg["gate_min"] = min(gate_mins) if gate_mins else 0.0
+    avg["gate_max"] = max(gate_maxs) if gate_maxs else 1.0
+    return tot_loss / max(n, 1), avg
 
-def _fmt(pa, assets):
-    return " ".join(f"{a.replace('USDT','')}:{w:.3f}" for a, w in zip(assets, pa))
 
-def _check_m1(m1):
-    nz = np.abs(m1).sum(axis = -1) > 0
-    c = nz.sum() / max(len(m1), 1)
-    if nz.sum() == 0:
-        print("WARNING: model1_outputs all zeros")
-        return False
-    print(f"m1 populated {c:.1%} range=[{m1[nz].min():+.4f},{m1[nz].max():+.4f}]")
-    return True
-
-def save_ckpt(path, model, opt, sched, epoch, best_vl, cfg):
-    cfg_save = {k: v for k, v in cfg.items()}
-    if "bench_weights" in cfg_save and torch.is_tensor(cfg_save["bench_weights"]):
-        cfg_save["bench_weights"] = cfg_save["bench_weights"].cpu().tolist()
-    torch.save({
-        "cfg": cfg_save, "model": model.state_dict(), "optimizer": opt.state_dict(),
-        "scheduler": sched.state_dict(), "epoch": epoch, "best_val_loss": best_vl,
-    }, path)
-
-def _mk_model(cfg, device, asset_vol):
-    model = Model2(
-        F_1h = cfg["F_1h"], F_15m = cfg["F_15m"], F_30m = cfg["F_30m"],
-        D_time_1h = cfg["D_time_1h"], D_time_15m = cfg["D_time_15m"], D_time_30m = cfg["D_time_30m"],
-        N_assets = cfg["N"], d_regime = cfg["d_regime"],
-        d_model = cfg["d_model"], d_lstm = cfg["d_lstm"], d_cross = cfg["d_cross"],
-        n_cross_heads = cfg["n_cross_heads"], dropout = cfg["dropout"],
-        embed_drop = cfg["embed_drop"], band_sharpness = cfg["band_sharpness"],
-        t_recent = cfg["t_recent"]).to(device)
-    model.alloc.set_inv_vol_prior(asset_vol.to(device))
-    return model
-
-def load_ckpt(path, device = "cpu"):
-    ckpt = torch.load(path, map_location = device, weights_only = False)
-    c = ckpt["cfg"]
-    if "bench_weights" in c and isinstance(c["bench_weights"], list):
-        c["bench_weights"] = torch.tensor(c["bench_weights"], device = device, dtype = torch.float32)
-    model = Model2(
-        F_1h = c["F_1h"], F_15m = c["F_15m"], F_30m = c["F_30m"],
-        D_time_1h = c["D_time_1h"], D_time_15m = c["D_time_15m"], D_time_30m = c["D_time_30m"],
-        N_assets = c["N"], d_regime = c.get("d_regime", 6),
-        d_model = c.get("d_model", 32), d_lstm = c.get("d_lstm", 32), d_cross = c.get("d_cross", 48),
-        n_cross_heads = c.get("n_cross_heads", 4), dropout = c.get("dropout", 0.12),
-        embed_drop = c.get("embed_drop", 0.5), band_sharpness = c.get("band_sharpness", 30.0),
-        t_recent = c.get("t_recent", 4)).to(device)
-    model.load_state_dict(ckpt["model"])
-    return model, ckpt
-
-def _mk_optim(model, cfg):
-    opt = torch.optim.AdamW(model.parameters(), lr = cfg["lr"], weight_decay = cfg["weight_decay"])
-    ct = cfg["epochs"] - cfg["warmup_epochs"]
-    w = torch.optim.lr_scheduler.LinearLR(opt, start_factor = cfg["warmup_start_factor"],
-                                          end_factor = 1.0, total_iters = cfg["warmup_epochs"])
-    c = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max = max(ct, 1), eta_min = cfg["scheduler_eta_min"])
-    s = torch.optim.lr_scheduler.SequentialLR(opt, schedulers = [w, c], milestones = [cfg["warmup_epochs"]])
-    return opt, s
-
-def _ep_print(ep, tr, va, model, tl, vl, el, cf):
-    temp = float(model.alloc.log_temp.exp().item())
-    print(f"  Ep {ep:03d} "
-          f"tr ir={tr['ir']:+.3f} tq={tr['trade_q']:+.4f} bp={tr['buy_pnl']:+.4f} "
-          f"sp={tr['sell_pnl']:+.4f} grs={tr['gross']:.3f}/{tr['desired_gross']:.3f} "
-          f"gate={tr['gate']:.3f} band={tr['band']:.3f} "
-          f"nb={tr['n_buys']:.1f} ns={tr['n_sells']:.1f} "
-          f"va ir={va['ir']:+.3f} tq={va['trade_q']:+.4f} grs={va['gross']:.3f} "
-          f"temp={temp:.3f} loss={tl:.4f}/{vl:.4f} "
-          f"cost={tr.get('cost_rate',0)*1e4:.1f}bps({cf*100:.0f}%) {el:.0f}s", flush = True)
-    print(f"    tr {_fmt(tr['per_asset'], ASSETS)}", flush = True)
-    print(f"    va {_fmt(va['per_asset'], ASSETS)}", flush = True)
-
-def build_trade_decision(out, prev_position, cfg, deadband = 0.005, min_notional = 0.005):
-    target = out["target"][0].cpu().numpy()
-    gate = float(out["gate"][0].cpu().numpy())
-    band = out["band"][0].cpu().numpy()
-    sharpness = cfg.get("band_sharpness", 30.0)
-    max_w = cfg.get("max_weight", 0.4)
-    aim = gate * target
-    deviation = prev_position - aim
-    abs_dev = np.abs(deviation)
-    snap_target = aim + np.sign(deviation) * band
-    snap_target = np.clip(snap_target, 0.0, max_w)
-    excess = abs_dev - band
-    strength = 1.0 / (1.0 + np.exp(-sharpness * excess))
-    new_pos = prev_position + strength * (snap_target - prev_position)
-    new_pos = np.clip(new_pos, 0.0, max_w)
-    delta = new_pos - prev_position
-    dc = np.where(np.abs(delta) < deadband, 0.0, delta)
-    trades = [{"asset_idx": int(i), "side": "buy" if d > 0 else "sell",
-               "weight_delta": float(d), "target_weight": float(new_pos[i])}
-              for i, d in enumerate(dc) if abs(d) >= min_notional]
-    return {"target_position": new_pos.tolist(), "trades": trades, "gross": float(new_pos.sum()),
-            "cash_weight": 1.0 - float(new_pos.sum()), "gate": gate, "band": band.tolist(),
-            "action": "hold" if not trades else "rebalance"}
+def _ep_print(ep, tr, va, tl, vl, el):
+    buys, sells = _fmt_signals(va.get("mean_pred", np.zeros(20)), ASSETS)
+    n_bull = int((va.get("n_bullish", np.zeros(20)) > 0.5).sum())
+    n_bear = 20 - n_bull
+    g_mean = va.get("gate_mean", va.get("gate", 0.5))
+    g_min = va.get("gate_min", 0.0)
+    g_max = va.get("gate_max", 1.0)
+    print(f"\n  {'=' * 68}")
+    print(f"  Epoch {ep}")
+    print(f"  {'=' * 68}")
+    print(f"  Prediction    Temporal IC: {tr['t_ic']:+.3f} / {va['t_ic']:+.3f}"
+          f"    Asset IC: {tr['xs_ic']:+.3f} / {va['xs_ic']:+.3f}")
+    print(f"                Direction: {tr['dir_acc']:.1%} / {va['dir_acc']:.1%}"
+          f"          NLL: {tr['nll']:.3f}")
+    print(f"  Portfolio     Return: {tr['port_ret']:+.4%} / {va['port_ret']:+.4%}"
+          f"       Bench: {tr['bench_ret']:+.4%}")
+    print(f"                Exposure: {tr['gross']:.1%} / {va['gross']:.1%}"
+          f"         Gate: {g_mean:.2f} [{g_min:.2f} to {g_max:.2f}]")
+    print(f"  Signals       Bullish: {n_bull}/20    Buy:  {buys}")
+    if sells != "none":
+        print(f"                Bearish: {n_bear}/20    Sell: {sells}")
+    print(f"  Weights       {_fmt_top(va['per_asset'], ASSETS)}")
+    print(f"  Loss: {tl:.4f} / {vl:.4f}  {el:.0f}s", flush = True)
 
 def _mk_dataset(npz_path, cfg, split):
-    return Model2Dataset(npz_path, seq_len_1h = cfg["seq_len_1h"], seq_k = cfg["seq_k"],
+    return Model2Dataset(npz_path, seq_len_4h = cfg["seq_len_4h"], seq_k = cfg["seq_k"],
                          split = split, stride = cfg["train_stride"],
-                         lookback_15m = cfg["lookback_15m"], lookback_30m = cfg["lookback_30m"])
+                         lookback_15m = cfg["lookback_15m"], lookback_1h = cfg["lookback_1h"])
+
 
 def _populate_cfg(ds, cfg):
     cfg["N"] = ds.N
-    cfg["F_1h"] = ds.F_1h
+    cfg["F_4h"] = ds.F_4h
     cfg["F_15m"] = ds.F_15m
-    cfg["F_30m"] = ds.F_30m
-    cfg["D_time_1h"] = ds.D_time_1h
+    cfg["F_1h"] = ds.F_1h
+    cfg["D_time_4h"] = ds.D_time_4h
     cfg["D_time_15m"] = ds.D_time_15m
-    cfg["D_time_30m"] = ds.D_time_30m
+    cfg["D_time_1h"] = ds.D_time_1h
     cfg["btc_idx"] = ds.assets.index("BTCUSDT")
 
-def train(cfg = None):
-    cfg = {**DEFAULT_CFG, **(cfg or {})}
+
+def _mk_model(cfg, device):
+    model = Model2(
+        F_4h = cfg["F_4h"], F_15m = cfg["F_15m"], F_1h = cfg["F_1h"],
+        D_time_4h = cfg["D_time_4h"], D_time_15m = cfg["D_time_15m"], D_time_1h = cfg["D_time_1h"],
+        N_assets = cfg["N"], d_regime = cfg["d_regime"],
+        d_model = cfg["d_model"], d_lstm = cfg["d_lstm"], d_cross = cfg["d_cross"],
+        n_cross_heads = cfg["n_cross_heads"], dropout = cfg["dropout"],
+        embed_drop = cfg["embed_drop"], t_recent = cfg["t_recent"]).to(device)
+    return model
+
+
+def load_ckpt(path, device):
+    ckpt = torch.load(path, map_location = device, weights_only = False)
+    c = ckpt["cfg"]
+    model = _mk_model(c, device)
+    model.load_state_dict(ckpt["model"])
+    return model, ckpt
+
+
+def train():
+    cfg = dict(DEFAULT_CFG)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     npz_path = os.path.join(BASE_DIR, "model2_dataset.npz")
     tr_ds = _mk_dataset(npz_path, cfg, "train")
     va_ds = _mk_dataset(npz_path, cfg, "val")
     te_ds = _mk_dataset(npz_path, cfg, "test")
-    print(f"Samples: train={len(tr_ds)} val={len(va_ds)} test={len(te_ds)}")
     _populate_cfg(tr_ds, cfg)
-    _check_m1(tr_ds.model1_outputs)
-    asset_vol = torch.from_numpy(tr_ds.asset_vol).float()
-    inv_vol = 1.0 / asset_vol.clamp(min = 1e-6)
-    bench_w = inv_vol / inv_vol.sum()
-    cfg["bench_weights"] = bench_w.to(device)
-    bench_str = " ".join(f"{a.replace('USDT','')}:{w:.3f}" for a, w in zip(ASSETS, bench_w.numpy()))
-    print(f"Benchmark (inv-vol): {bench_str}")
-    model = _mk_model(cfg, device, asset_vol)
-    n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params: {n_p:,} samples:params={len(tr_ds)/max(n_p,1):.2f}:1")
-    print(f"F_1h={cfg['F_1h']} F_15m={cfg['F_15m']} F_30m={cfg['F_30m']}")
-    print(f"Model: d_model={cfg['d_model']} d_lstm={cfg['d_lstm']} d_cross={cfg['d_cross']} "
-          f"heads={cfg['n_cross_heads']} dropout={cfg['dropout']}")
-    print(f"Davis-Norman: band_sharpness={cfg['band_sharpness']} band_target={cfg['band_target']} "
-          f"band_reg_coef={cfg['band_reg_coef']} max_weight={cfg['max_weight']}")
-    print(f"Trade quality: coef={cfg['trade_q_coef']} min_delta={cfg['trade_q_min_delta']} "
-          f"fwd_horizon={cfg['trade_q_fwd_horizon']} fwd_decay={cfg['trade_q_fwd_decay']} "
-          f"loss_aversion={cfg['trade_q_loss_aversion']}")
-    print(f"Regime sizing: bull={cfg['bull_gross_target']} bear={cfg['bear_gross_target']} "
-          f"neutral={cfg['neutral_gross_target']} coef={cfg['regime_gross_coef']}")
-    opt, sched = _mk_optim(model, cfg)
-    pin = device.type == "cuda"
-    tr_ld = DataLoader(tr_ds, batch_size = cfg["batch_size"], shuffle = True,
-                       num_workers = 0, pin_memory = pin, drop_last = True)
-    va_ld = DataLoader(va_ds, batch_size = cfg["batch_size"] * 2, shuffle = False,
-                       num_workers = 0, pin_memory = pin)
-    te_ld = DataLoader(te_ds, batch_size = cfg["batch_size"] * 2, shuffle = False,
-                       num_workers = 0, pin_memory = pin)
+    print(f"Samples: train={len(tr_ds)} val={len(va_ds)} test={len(te_ds)}")
+    m1_pop = (tr_ds.model1_outputs.sum(axis = -1) != 0).mean()
+    m1_range = f"[{tr_ds.model1_outputs.min():+.4f},{tr_ds.model1_outputs.max():+.4f}]"
+    print(f"m1 populated {m1_pop:.1%} range={m1_range}")
+    model = _mk_model(cfg, device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    ratio = len(tr_ds) / n_params if n_params > 0 else 0
+    print(f"Params: {n_params:,} samples:params={ratio:.2f}:1")
+    print(f"F_4h={cfg['F_4h']} F_1h={cfg['F_1h']} F_15m={cfg['F_15m']}")
+    print(f"Model: d_model={cfg['d_model']} d_lstm={cfg['d_lstm']} d_cross={cfg['d_cross']} heads={cfg['n_cross_heads']} dropout={cfg['dropout']}")
+    print(f"Loss: temporal_ic={cfg['temporal_ic_coef']} xs_ic={cfg['xs_ic_coef']} nll={cfg['nll_coef']} directional={cfg['directional_coef']}")
+    tr_loader = DataLoader(tr_ds, batch_size = cfg["batch_size"], shuffle = True, drop_last = True, num_workers = 0)
+    va_loader = DataLoader(va_ds, batch_size = cfg["batch_size"], shuffle = False, drop_last = False, num_workers = 0)
+    te_loader = DataLoader(te_ds, batch_size = cfg["batch_size"], shuffle = False, drop_last = False, num_workers = 0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr = cfg["lr"], weight_decay = cfg["weight_decay"])
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor = cfg["warmup_start_factor"], total_iters = cfg["warmup_epochs"])
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = cfg["epochs"] - cfg["warmup_epochs"], eta_min = cfg["scheduler_eta_min"])
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones = [cfg["warmup_epochs"]])
+    best_val = float("inf")
+    wait = 0
     ckpt_dir = os.path.join(BASE_DIR, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok = True)
-    bp = os.path.join(ckpt_dir, "model2_best.pt")
-    best_vl, pat = float("inf"), 0
+    ckpt_path = os.path.join(ckpt_dir, "model2_best.pt")
     for ep in range(1, cfg["epochs"] + 1):
         t0 = time.time()
-        tl, ts = train_epoch(model, tr_ld, opt, device, cfg, epoch = ep)
-        vl, vs = eval_epoch(model, va_ld, device, cfg)
-        sched.step()
-        _ep_print(ep, ts, vs, model, tl, vl, time.time() - t0, ts.get("cost_frac", 0))
-        if vl < best_vl:
-            best_vl, pat = vl, 0
-            save_ckpt(bp, model, opt, sched, ep, best_vl, cfg)
-            print(f"  => saved best val_loss={best_vl:.4f}")
+        tl, tr_s = train_epoch(model, tr_loader, optimizer, cfg, ep, device)
+        vl, va_s = eval_epoch(model, va_loader, cfg, device)
+        scheduler.step()
+        el = time.time() - t0
+        _ep_print(ep, tr_s, va_s, tl, vl, el)
+        if vl < best_val:
+            best_val = vl
+            wait = 0
+            torch.save({"model": model.state_dict(), "cfg": cfg, "epoch": ep,
+                         "val_loss": vl, "val_stats": va_s}, ckpt_path)
+            print(f"  => saved best val_loss={vl:.4f}")
         else:
-            pat += 1
-            if pat >= cfg["patience"]:
+            wait += 1
+            if wait >= cfg["patience"]:
                 print(f"  Early stop ep {ep}")
                 break
-    print("\nLoading best for test")
-    model, _ = load_ckpt(bp, device)
-    tl, ts = eval_epoch(model, te_ld, device, cfg)
-    print(f"Test loss={tl:.4f} ir={ts['ir']:+.3f} tq={ts['trade_q']:+.4f} "
-          f"net_ret={ts['net_ret']:+.5f} bench_ret={ts['bench_ret']:+.5f} btc_ret={ts['btc_ret']:+.5f} "
-          f"excess_vs_bench={ts['excess_ret']:+.5f} excess_vs_btc={ts['excess_vs_btc']:+.5f} "
-          f"grs={ts['gross']:.3f} gate={ts['gate']:.3f} band={ts['band']:.3f} "
-          f"ntr={ts['n_trades']:.1f} max_w={ts['max_w']:.3f}")
-    print(f"Test {_fmt(ts['per_asset'], ASSETS)}")
-    return model, ts
+    print(f"\nLoading best for test")
+    model, ckpt = load_ckpt(ckpt_path, device)
+    tl, ts = eval_epoch(model, te_loader, cfg, device)
+    buys, sells = _fmt_signals(ts.get("mean_pred", np.zeros(20)), ASSETS)
+    g_mean = ts.get("gate_mean", ts.get("gate", 0.5))
+    print(f"\n  {'=' * 68}")
+    print(f"  TEST RESULTS")
+    print(f"  {'=' * 68}")
+    print(f"  Prediction    Temporal IC: {ts['t_ic']:+.3f}    Asset IC: {ts['xs_ic']:+.3f}    Direction: {ts['dir_acc']:.1%}")
+    print(f"  Portfolio     Return: {ts['port_ret']:+.4%}    Bench: {ts['bench_ret']:+.4%}    BTC: {ts['btc_ret']:+.4%}")
+    print(f"                Excess: {ts['excess_ret']:+.4%}    Exposure: {ts['gross']:.1%}    Gate: {g_mean:.2f} [{ts.get('gate_min',0):.2f} to {ts.get('gate_max',1):.2f}]")
+    print(f"  Signals       Buy:  {buys}")
+    if sells != "none":
+        print(f"                Sell: {sells}")
+    print(f"  Weights       {_fmt_top(ts['per_asset'], ASSETS)}")
+    print(f"  Max weight: {ts['max_w']:.1%}    Concentration: {ts.get('hhi',0):.3f}")
+    return model
+
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    args = ap.parse_args()
     train()

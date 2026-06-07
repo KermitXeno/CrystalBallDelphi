@@ -4,16 +4,18 @@ TRANSITION_LOOKAHEAD_15M = 16
 TRANSITION_PERSISTENCE_15M = 32
 TRANSITION_MIN_AGREEMENT = 0.75
 
-# For each timestep, label as transition if at least TRANSITION_MIN_AGREEMENT fraction of the next
-def _persistent_transition_labels(regime_argmax, n_classes):
-    windows = [regime_argmax.shift(-i) for i in range(TRANSITION_LOOKAHEAD_15M,
-                                                      TRANSITION_LOOKAHEAD_15M + TRANSITION_PERSISTENCE_15M)]
+TREND_CAMP = {0: 0, 1: 1, 2: 1, 3: 0}
+
+def _reversal_transition_labels(regime_argmax):
+    trend_class = regime_argmax.map(TREND_CAMP)
+    windows = [trend_class.shift(-i) for i in range(TRANSITION_LOOKAHEAD_15M,
+                                                     TRANSITION_LOOKAHEAD_15M + TRANSITION_PERSISTENCE_15M)]
     future = pd.concat(windows, axis = 1)
     threshold_count = TRANSITION_PERSISTENCE_15M * TRANSITION_MIN_AGREEMENT
     transition = pd.Series(0.0, index = regime_argmax.index, dtype = np.float32)
-    for k in range(n_classes):
+    for k in range(2):
         eq_k = (future == k).sum(axis = 1)
-        persistent_to_k = (eq_k >= threshold_count) & (regime_argmax != k)
+        persistent_to_k = (eq_k >= threshold_count) & (trend_class != k)
         transition[persistent_to_k.values] = 1.0
     invalid_tail = TRANSITION_LOOKAHEAD_15M + TRANSITION_PERSISTENCE_15M - 1
     transition.iloc[-invalid_tail:] = np.nan
@@ -21,20 +23,17 @@ def _persistent_transition_labels(regime_argmax, n_classes):
     transition[invalid_rows.values] = np.nan
     return transition
 
-# For a given horizon, compute indicators with lookback equal to the horizon length, sample at block offsets, and aggregate by mean and slope
 def _features_for_horizon(px_15m, h_name):
-    h_bars = HORIZON_BARS_15M[h_name]
-    lookback = h_bars
-    indicators = compute_horizon_indicators(px_15m, lookback)
-    block_features = sample_at_block_offsets(indicators, h_bars)
+    cfg = HORIZON_CFG[h_name]
+    indicators = compute_hierarchical_indicators(px_15m, h_name)
+    block_features = sample_blocks_hierarchical(indicators, cfg["phase_shift"])
     aggregated = aggregate_blocks_mean_slope(block_features)
-    norm_window = max(64, h_bars * 4)
+    norm_window = max(64, cfg["window"] * 4)
     aggregated_norm = {}
     for name, df in aggregated.items():
         aggregated_norm[f"{h_name}_{name}"] = normalise(df, window = norm_window)
     return aggregated_norm
 
-# Compute the PEF derivative at 1h cadence, then forward-fill to 15m. This captures the regime change signal at the 1h level while providing a smoothly updated feature at 15m.
 def _compute_pef_deriv_1h(px_15m):
     c = px_15m["close"]
     r_15m = np.log(c / c.shift(1)).ffill().fillna(0)
@@ -46,13 +45,10 @@ def _compute_pef_deriv_1h(px_15m):
     pe_deriv_15m = pe_deriv_s.reindex(c.index, method = "ffill").fillna(0)
     return pe_deriv_15m
 
-# Compute a set of global features at 15m cadence, including breadth, return dispersion, volatility regime, and the PEF derivative sampled at 1h cadence and forward-filled to 15m.
 def _global_features_15m(px_15m):
     c = px_15m["close"]
     r = np.log(c / c.shift(1))
     btc_col = next((col for col in c.columns if "BTC" in col), c.columns[0])
-    print("  computing pef_deriv at 1h cadence...")
-    pef_deriv = _compute_pef_deriv_1h(px_15m)
     breadth_64 = (c > c.rolling(64).mean()).mean(axis = 1)
     breadth_256 = (c > c.rolling(256).mean()).mean(axis = 1)
     ret_dispersion_64 = np.log(c / c.shift(64)).std(axis = 1)
@@ -62,6 +58,7 @@ def _global_features_15m(px_15m):
     btc_dominance = btc_vol / (avg_vol + 1e-9)
     vol_of_vol = r.rolling(64).std().mean(axis = 1).rolling(64).std()
     rolling_corr = r.rolling(64).corr().groupby(level = 0).mean().mean(axis = 1)
+    breakout_breadth_64 = compute_breakout_breadth(c, 64)
     return normalise(pd.DataFrame({
         "breadth_64": breadth_64,
         "breadth_256": breadth_256,
@@ -70,11 +67,9 @@ def _global_features_15m(px_15m):
         "btc_dominance": btc_dominance,
         "vol_of_vol": vol_of_vol,
         "corr_regime": rolling_corr,
-        "pef_deriv": pef_deriv,
+        "breakout_breadth_64": breakout_breadth_64,
     }), window = 256)
 
-# Compute a set of raw features for BTC at 15m cadence, including EMA slope, ADX, and realized volatility relative to its historical median. 
-# These features are not sampled at block offsets and are intended to provide a rich signal about BTC's current state that may be predictive of regime changes.
 def _btc_raw_features_15m(px_15m):
     c = px_15m["close"]
     h = px_15m["high"]
@@ -90,27 +85,35 @@ def _btc_raw_features_15m(px_15m):
     btc_rv_q50 = btc_rv.rolling(4096, min_periods = 1024).quantile(0.50)
     adx, _ = compute_adx(btc_h.to_frame("b"), btc_l.to_frame("b"), btc_c.to_frame("b"), 64)
     btc_adx = adx.iloc[:, 0]
+    btc_accel = btc_ema_slope.diff()
+    btc_accel_smooth = btc_accel.ewm(span = 64, adjust = False).mean()
+    btc_accel_std = btc_accel_smooth.rolling(1024, min_periods = 256).std().clip(lower = 1e-12)
+    btc_slope_accel = np.tanh(btc_accel_smooth / btc_accel_std).fillna(0.0)
+    btc_range_pos = compute_range_position(btc_c, 256)
+    btc_breakout = compute_breakout(btc_c, 64)
     return pd.DataFrame({
         "btc_ema_positive": (btc_ema_slope > 0).astype(float).fillna(0),
         "btc_adx_raw": btc_adx.clip(0, 1).fillna(0),
         "btc_rv_vs_q50": (btc_rv / (btc_rv_q50 + 1e-9)).clip(0, 5).fillna(1.0),
+        "btc_slope_accel": btc_slope_accel,
+        "btc_range_pos": btc_range_pos,
+        "btc_breakout": btc_breakout,
     }, index = c.index)
 
-# Main function to process the model1 dataset. It computes node features for multiple horizons, global features, BTC-specific raw features, 
-# regime scores, and transition labels. It then identifies valid timesteps where all features are available and saves the processed dataset to a compressed NPZ file.
 def process_model1(px_15m):
-    print("Building model1 dataset (15m cadence, multi-horizon blocks)...")
+    print("Building model1 dataset (15m cadence, hierarchical multi-horizon)...")
     c = px_15m["close"]
     assets = c.columns.tolist()
     N = len(assets)
     print(f"  assets: {N}  raw 15m bars: {len(c)}")
 
     all_node_feats = {}
-    for h_name in HORIZON_BARS_15M:
+    for h_name in HORIZON_CFG:
         feats = _features_for_horizon(px_15m, h_name)
         n_feat = len(feats)
         all_node_feats.update(feats)
-        print(f"  {h_name}: {n_feat} features (mean+slope per base)")
+        cfg = HORIZON_CFG[h_name]
+        print(f"  {h_name}: {n_feat} features  window={cfg['window']}  cadence={cfg['cadence']}  shift={cfg['phase_shift']}")
     print(f"  total node features per asset: {len(all_node_feats)}")
 
     global_feats = _global_features_15m(px_15m)
@@ -122,14 +125,13 @@ def process_model1(px_15m):
     regime_scores = compute_regime_scores_15m(px_15m)
     regime_argmax = pd.Series(regime_scores.values.argmax(axis = 1).astype(np.int8),
                               index = regime_scores.index)
-    bull_avg = float(regime_scores["bull"].mean())
-    bear_avg = float(regime_scores["bear"].mean())
-    neutral_avg = float(regime_scores["neutral"].mean())
-    print(f"  regime scores avg: bull={bull_avg:.3f} bear={bear_avg:.3f} neutral={neutral_avg:.3f}")
+    for col in regime_scores.columns:
+        print(f"  regime {col}: mean={float(regime_scores[col].mean()):.3f}")
 
-    n_classes = 3
-    transition_label = _persistent_transition_labels(regime_argmax, n_classes)
-    raw_flips = (regime_argmax.shift(-TRANSITION_LOOKAHEAD_15M) != regime_argmax).astype(np.float32)
+    n_classes = 4
+    transition_label = _reversal_transition_labels(regime_argmax)
+    raw_flips = (regime_argmax.map(TREND_CAMP).shift(-TRANSITION_LOOKAHEAD_15M) !=
+                 regime_argmax.map(TREND_CAMP)).astype(np.float32)
     raw_flips.iloc[-TRANSITION_LOOKAHEAD_15M:] = np.nan
     raw_rate = float(raw_flips.dropna().mean())
     persistent_rate = float(transition_label.dropna().mean())
@@ -140,9 +142,18 @@ def process_model1(px_15m):
     print(f"  valid timesteps: {len(valid)}")
 
     sent_scores, sent_missing = sentiment_placeholder(len(valid), N)
+    node_arr = stack_node_array(all_node_feats, valid)
+    market_features = node_arr.mean(axis = 1)
+    print(f"  market_features: {market_features.shape}")
+
+    feature_names = (list(all_node_feats.keys())
+                     + list(global_feats.columns)
+                     + list(btc_raw.columns))
+    print(f"  total XGB features: {len(feature_names)} ({market_features.shape[1]} node_avg + {global_feats.shape[1]} global + {btc_raw.shape[1]} btc_raw)")
 
     save_npz("model1_dataset",
-             node_features = stack_node_array(all_node_feats, valid),
+             node_features = node_arr,
+             market_features = market_features,
              global_features = global_feats.loc[valid].values.astype(np.float32),
              btc_raw = btc_raw.loc[valid].values.astype(np.float32),
              regime_scores = regime_scores.loc[valid].values.astype(np.float32),
@@ -152,4 +163,5 @@ def process_model1(px_15m):
              time_enc = compute_time_encoding(valid.asi8, "15m"),
              sentiment_scores = sent_scores,
              sentiment_missing = sent_missing,
-             horizon_names = np.array(list(HORIZON_BARS_15M.keys()), dtype = "U8"))
+             horizon_names = np.array(list(HORIZON_CFG.keys()), dtype = "U8"),
+             feature_names = np.array(feature_names, dtype = "U40"))

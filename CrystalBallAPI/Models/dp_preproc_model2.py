@@ -1,64 +1,21 @@
-from dp_features import *
+import os
+import numpy as np
+import pandas as pd
+from dp_features import (
+    winsorize, normalise, get_valid_index, stack_node_array,
+    compute_time_encoding, save_npz, sentiment_placeholder,
+    compute_hierarchical_indicators, sample_blocks_hierarchical,
+    aggregate_blocks_mean_slope, aggregate_ohlcv, yang_zhang_vol,
+    compute_adx, compute_rsi, compute_atr,
+    HORIZON_CFG, BASE_DIR,
+)
 
-def _build_sub_hourly_feats(px, window):
-    c, h, l, o = px["close"], px["high"], px["low"], px["open"]
-    r = np.log(c / c.shift(1))
-    vol = px["volume"]
-    bp = px["taker_buy_base_volume"] / (vol + 1e-9)
-    bb_mid = c.rolling(20).mean()
-    bb_std = c.rolling(20).std()
-    macd_line = c.ewm(span = 12, adjust = False).mean() - c.ewm(span = 26, adjust = False).mean()
-    vwap = ((c + h + l) / 3 * vol).rolling(48).sum() / (vol.rolling(48).sum() + 1e-9)
-    ema20 = c.ewm(span = 20, adjust = False).mean()
-    atr = compute_atr(h, l, c, 14)
-    feats = build_features({
-        "ret_1": r,
-        "ret_4": np.log(c / c.shift(4)),
-        "ret_16": np.log(c / c.shift(16)),
-        "ret_48": np.log(c / c.shift(48)),
-        "vol_yz": yang_zhang_vol(h, l, c, o, 30),
-        "vol_ratio": yang_zhang_vol(h, l, c, o, 8) / (yang_zhang_vol(h, l, c, o, 48) + 1e-9),
-        "rsi": compute_rsi(c, 14),
-        "stoch_rsi": compute_stoch_rsi(c),
-        "macd_hist": (macd_line - macd_line.ewm(span = 9, adjust = False).mean()) / (c + 1e-9),
-        "bb_pos": (c - (bb_mid - 2 * bb_std)) / (4 * bb_std + 1e-9),
-        "bb_width": 4 * bb_std / (bb_mid + 1e-9),
-        "keltner_pos": (c - (ema20 - 2 * atr)) / (4 * atr + 1e-9),
-        "cci": compute_cci(h, l, c, 14),
-        "williams_r": compute_williams_r(h, l, c, 14),
-        "atr_norm": atr / (c + 1e-9),
-        "hl_spread": (h - l) / (c + 1e-9),
-        "oc_body": (c - o) / (o + 1e-9),
-        "vwap_dev": (c - vwap) / (vwap + 1e-9),
-        "vol_zscore": vol / (vol.rolling(48).mean() + 1e-9),
-        "buy_pres": bp,
-        "buy_pres_q": px["taker_buy_quote_volume"] / (px["quote_asset_volume"] + 1e-9),
-        "ord_imb": bp * 2 - 1,
-        "cmf": compute_cmf(h, l, c, vol, 20),
-        "obv_mom": compute_obv_mom(c, vol, 14),
-        "trades_log": np.log1p(px["num_trades"]),
-        "amihud": amihud_illiq(r, vol, 20),
-        "roll_sp": roll_spread(r, 20),
-        "kyle_lam": kyle_lambda(r, vol, 20),
-        "vpin": (bp * 2 - 1).abs().rolling(50).mean(),
-        **ichimoku_features(h, l, c),
-    }, window = window)
-    valid = get_valid_index(list(feats.values()))
-    if len(valid) == 0:
-        print(f"  DEBUG empty intersection - per-feature first-valid timestamps:")
-        for fname, fdf in feats.items():
-            mask_all = fdf.replace([np.inf, -np.inf], np.nan).notna().all(axis = 1)
-            n_valid = mask_all.sum()
-            first_valid = fdf.index[mask_all].min() if n_valid > 0 else None
-            n_per_col = fdf.replace([np.inf, -np.inf], np.nan).notna().sum()
-            min_col = n_per_col.idxmin()
-            print(f"    {fname}: n_valid={n_valid} first_valid={first_valid} weakest={min_col}({n_per_col[min_col]})")
-    return feats, valid
 
 def _xrank(df):
     return df.rank(axis = 1, pct = True).fillna(0.5)
 
-def _rolling_beta_btc(r, btc_r, window = 72, min_periods = 24):
+
+def _rolling_beta_btc(r, btc_r, window = 30, min_periods = 10):
     btc_var = btc_r.rolling(window, min_periods = min_periods).var().clip(lower = 1e-10)
     betas = pd.DataFrame(index = r.index, columns = r.columns, dtype = np.float64)
     for col in r.columns:
@@ -66,142 +23,190 @@ def _rolling_beta_btc(r, btc_r, window = 72, min_periods = 24):
         betas[col] = (cov_col / btc_var).clip(-5, 5)
     return betas.astype(np.float32)
 
-def _build_4h_feats(px_4h):
-    c, h, l, o = px_4h["close"], px_4h["high"], px_4h["low"], px_4h["open"]
+
+def _build_15m_timing(px_15m, window = 120):
+    c = px_15m["close"]
+    h = px_15m["high"]
+    l = px_15m["low"]
+    v = px_15m["volume"]
     r = np.log(c / c.shift(1))
-    vol = px_4h["volume"]
-    bp = px_4h["taker_buy_base_volume"] / (vol + 1e-9)
-    adx, _ = compute_adx(h, l, c, 14)
-    vol_yz = yang_zhang_vol(h, l, c, o, 30)
-    ret_4 = np.log(c / c.shift(4))
-    tenkan = (h.rolling(9).max() + l.rolling(9).min()) / 2
+    bp = px_15m["taker_buy_base_volume"] / (v + 1e-9)
+    vol_mean = v.rolling(48, min_periods = 8).mean().clip(lower = 1e-9)
+    feats = {
+        "ret_1": normalise(r.fillna(0), window),
+        "ret_4": normalise(np.log(c / c.shift(4)).fillna(0), window),
+        "vol_surge": (v / vol_mean).clip(0, 10).fillna(1.0),
+        "buy_pressure": bp.fillna(0.5),
+        "order_imbalance": (bp * 2 - 1).fillna(0.0),
+        "hl_spread": normalise(((h - l) / (c + 1e-9)).fillna(0), window),
+    }
+    valid = get_valid_index(list(feats.values()))
+    return feats, valid
+
+
+def _build_1h_hierarchical(px_15m):
+    indicators = compute_hierarchical_indicators(px_15m, "1h")
+    phase_shift = HORIZON_CFG["1h"]["phase_shift"]
+    blocks = sample_blocks_hierarchical(indicators, phase_shift, n_blocks = 4)
+    feats = aggregate_blocks_mean_slope(blocks)
+    valid = get_valid_index(list(feats.values()))
+    return feats, valid
+
+
+def _build_4h_features(px_15m):
+    indicators_4h = compute_hierarchical_indicators(px_15m, "4h")
+    blocks_4h = sample_blocks_hierarchical(indicators_4h, HORIZON_CFG["4h"]["phase_shift"], n_blocks = 4)
+    feats_4h = aggregate_blocks_mean_slope(blocks_4h)
+    indicators_16h = compute_hierarchical_indicators(px_15m, "16h")
+    blocks_16h = sample_blocks_hierarchical(indicators_16h, HORIZON_CFG["16h"]["phase_shift"], n_blocks = 4)
+    feats_16h = aggregate_blocks_mean_slope(blocks_16h)
+    for k, v in feats_16h.items():
+        feats_4h[f"16h_{k}"] = v
+    indicators_64h = compute_hierarchical_indicators(px_15m, "64h")
+    blocks_64h = sample_blocks_hierarchical(indicators_64h, HORIZON_CFG["64h"]["phase_shift"], n_blocks = 4)
+    feats_64h = aggregate_blocks_mean_slope(blocks_64h)
+    for k, v in feats_64h.items():
+        feats_4h[f"64h_{k}"] = v
+    c = px_15m["close"]
+    h = px_15m["high"]
+    l = px_15m["low"]
+    o = px_15m["open"]
+    v = px_15m["volume"]
+    r = np.log(c / c.shift(1))
+    agg = aggregate_ohlcv(px_15m, 16)
+    c4 = agg["close"]
+    r4 = np.log(c4 / c4.shift(16))
     btc_col = next((col for col in c.columns if "BTC" in col), c.columns[0])
     btc_r = r[btc_col]
-    feats = build_features({
-        "ret_1": r,
-        "ret_4": ret_4,
-        "stoch_rsi": compute_stoch_rsi(c),
-        "adx": adx,
-        "tenkan_dev": (c - tenkan) / (c + 1e-9),
-    }, window = 60)
-    n_zscore = len(feats)
-    excess_r1 = r.sub(btc_r, axis = 0)
-    beta_btc = _rolling_beta_btc(r, btc_r, window = 30, min_periods = 10)
+    r4_btc = np.log(c4[btc_col] / c4[btc_col].shift(16))
+    excess_r = r4.sub(r4_btc, axis = 0)
+    beta_btc = _rolling_beta_btc(r, btc_r, window = 480, min_periods = 160)
     idio_ret = r.sub(beta_btc.multiply(btc_r, axis = 0))
-    idio_vol = idio_ret.rolling(30, min_periods = 10).std()
-    rolling_max = c.rolling(12, min_periods = 1).max()
-    vol_mean_30 = vol.rolling(30, min_periods = 8).mean()
-    vol_std_30 = vol.rolling(30, min_periods = 8).std().clip(lower = 1e-9)
-    vol_rank = vol.rank(axis = 1, pct = True).fillna(0.5)
-    rolling_std_24 = r.rolling(24, min_periods = 8).std().clip(lower = 1e-8)
-    r3 = r.pow(3)
-    r2 = r.pow(2)
-    r3_sum = r3.rolling(24, min_periods = 12).sum()
-    r2_sum = r2.rolling(24, min_periods = 12).sum()
-    amihud_raw = (r.abs() / (vol + 1e-9)).rolling(24, min_periods = 8).mean()
+    idio_vol = idio_ret.rolling(480, min_periods = 160).std()
+    feats_4h["xrank_ret4"] = _xrank(r4)
+    feats_4h["xrank_vol"] = _xrank(yang_zhang_vol(h, l, c, o, 480))
+    feats_4h["excess_ret"] = winsorize(excess_r).fillna(0)
+    feats_4h["idio_vol"] = normalise(idio_vol.fillna(0), 960)
+    feats_4h["beta_btc"] = beta_btc.clip(-3, 3).fillna(1.0)
+    vol_rank = v.rank(axis = 1, pct = True).fillna(0.5)
+    feats_4h["vol_return_interact"] = (np.sign(r) * vol_rank).fillna(0)
     pos_bars = (r > 0).astype(float)
-    var_short = r.rolling(12, min_periods = 6).var().clip(lower = 1e-12)
-    ret_4bar = np.log(c / c.shift(4))
-    var_long = ret_4bar.rolling(8, min_periods = 4).var().clip(lower = 1e-12)
-    down_sv = compute_downside_semivariance(r, 24)
-    up_sv = compute_upside_semivariance(r, 24)
-    pos_jv, neg_jv = compute_signed_jump_var(r, 24)
-    feats["xrank_ret1"] = _xrank(r)
-    feats["xrank_ret4"] = _xrank(ret_4)
-    feats["xrank_vol"] = _xrank(vol_yz)
-    feats["xrank_volume"] = _xrank(vol)
-    feats["ret_vs_mean"] = winsorize(r.sub(r.mean(axis = 1), axis = 0)).fillna(0)
-    feats["excess_ret1"] = winsorize(excess_r1).fillna(0)
-    feats["adx_raw"] = adx.clip(0, 1).fillna(0.2)
-    feats["vol_return_interact"] = (np.sign(r) * vol_rank).fillna(0)
-    feats["reversal_signal"] = winsorize(r * (1.0 - vol_rank)).fillna(0)
-    feats["detrended_volume"] = ((vol - vol_mean_30) / vol_std_30).clip(-5, 5).fillna(0)
-    feats["idio_vol"] = normalise(idio_vol.fillna(0), 60)
-    feats["jump_flag"] = (r.abs() / rolling_std_24).clip(0, 5).fillna(0)
-    feats["realized_skew"] = (r3_sum / (r2_sum.pow(1.5).clip(lower = 1e-12) / 24.0 ** 0.5)).clip(-5, 5).fillna(0)
-    feats["amihud_rank"] = _xrank(amihud_raw)
-    feats["bp_delta"] = winsorize(bp - bp.shift(4)).fillna(0)
-    feats["return_consistency"] = pos_bars.rolling(12, min_periods = 6).mean().fillna(0.5)
-    feats["variance_ratio"] = (var_long / (4.0 * var_short)).clip(0.1, 5.0).fillna(1.0)
-    feats["high_distance"] = ((c - rolling_max) / (rolling_max + 1e-9)).clip(-1, 0).fillna(0)
-    feats["volume_momentum"] = (vol.rolling(4, min_periods = 2).mean() / vol.rolling(24, min_periods = 8).mean().clip(lower = 1e-9)).clip(0, 5).fillna(1.0)
-    feats["realized_kurtosis"] = compute_realized_kurtosis(r, 24)
-    feats["xrank_down_semivar"] = _xrank(down_sv)
-    feats["xrank_up_semivar"] = _xrank(up_sv)
-    feats["xrank_pos_jump"] = _xrank(pos_jv)
-    feats["xrank_neg_jump"] = _xrank(neg_jv)
-    feats["price_acceleration"] = winsorize(compute_price_acceleration(c, 4, 24)).fillna(0)
-    feats["relative_strength_24"] = winsorize(compute_relative_strength(r, btc_r, 24)).fillna(0)
-    feats["net_flow_persistence"] = compute_net_flow_persistence(bp, 12)
-    feats["tail_ratio"] = compute_tail_ratio(r, 24)
-    feats["xrank_max_return"] = _xrank(compute_max_return(r, 24))
-    xs_median_r = r.median(axis = 1)
-    alpha_t = r.sub(xs_median_r, axis = 0)
-    past_alpha_6 = alpha_t.rolling(6, min_periods = 3).sum()
-    past_alpha_12 = alpha_t.rolling(12, min_periods = 6).sum()
-    past_alpha_24 = alpha_t.rolling(24, min_periods = 12).sum()
-    feats["xrank_past_alpha_6"] = _xrank(past_alpha_6)
-    feats["xrank_past_alpha_12"] = _xrank(past_alpha_12)
-    feats["xrank_past_alpha_24"] = _xrank(past_alpha_24)
-    n_added = len(feats) - n_zscore
-    print(f"  4h features: {len(feats)} total ({n_zscore} z-scored + {n_added} cross-sectional/research)")
-    ret_tgt, shr_tgt, dd_tgt = build_targets(c, r, l, horizon = 1)
-    valid = get_valid_index(list(feats.values()) + [ret_tgt, shr_tgt, dd_tgt])
-    return feats, ret_tgt, shr_tgt, dd_tgt, valid
+    feats_4h["return_consistency"] = pos_bars.rolling(192, min_periods = 48).mean().fillna(0.5)
+    rolling_max = c.rolling(384, min_periods = 16).max()
+    feats_4h["high_distance"] = ((c - rolling_max) / (rolling_max + 1e-9)).clip(-1, 0).fillna(0)
+    xs_median_r = r4.median(axis = 1)
+    alpha_t = r4.sub(xs_median_r, axis = 0)
+    past_alpha_96 = alpha_t.rolling(96, min_periods = 48).sum()
+    past_alpha_384 = alpha_t.rolling(384, min_periods = 192).sum()
+    feats_4h["xrank_past_alpha_96"] = _xrank(past_alpha_96)
+    feats_4h["xrank_past_alpha_384"] = _xrank(past_alpha_384)
+    ret_4h = r4.shift(-16).fillna(0)
+    sharpe_4h = ret_4h / (r.rolling(384, min_periods = 96).std().clip(lower = 1e-6))
+    dd_4h = (c - rolling_max) / (rolling_max + 1e-9)
+    n_hier = sum(1 for k in feats_4h if not k.startswith("xrank") and not k.startswith("excess")
+                 and not k.startswith("idio") and not k.startswith("beta")
+                 and not k.startswith("vol_return") and not k.startswith("return_cons")
+                 and not k.startswith("high_dist") and k != "vol_return_interact")
+    print(f"  4h features: {len(feats_4h)} total ({n_hier} hierarchical + {len(feats_4h) - n_hier} cross-sectional)")
+    valid = get_valid_index(list(feats_4h.values()) + [ret_4h, sharpe_4h, dd_4h])
+    return feats_4h, ret_4h, sharpe_4h, dd_4h, valid
 
-def process_model2(px_15m, px_1h, px_4h):
-    print("Building model2 dataset (4h primary horizon)...")
-    assets = px_4h["close"].columns.tolist()
+
+def process_model2(px_15m):
+    print("Building model2 dataset (hierarchical multi-horizon)...")
+    c = px_15m["close"]
+    assets = c.columns.tolist()
     N = len(assets)
-    print(f"  asset count: {N}")
-    print(f"  per-asset row counts (close):")
-    for col in px_4h["close"].columns:
-        n15 = px_15m["close"][col].dropna().shape[0] if col in px_15m["close"].columns else 0
-        n1h = px_1h["close"][col].dropna().shape[0] if col in px_1h["close"].columns else 0
-        n4h = px_4h["close"][col].dropna().shape[0]
-        print(f"    {col}: 15m={n15} 1h={n1h} 4h={n4h}")
-    feats_15m, valid_15m = _build_sub_hourly_feats(px_15m, window = 120)
-    feats_1h, valid_1h_sub = _build_sub_hourly_feats(px_1h, window = 96)
-    feats_4h, ret_4h, shr_4h, dd_4h, valid_4h = _build_4h_feats(px_4h)
-    print(f"  raw valid counts: 15m={len(valid_15m)} 1h_sub={len(valid_1h_sub)} 4h={len(valid_4h)}")
-    if len(valid_15m) == 0 or len(valid_1h_sub) == 0:
-        raise RuntimeError("sub-hourly valid index is empty - one or more assets has insufficient data at this frequency (see per-asset counts above)")
+    print(f"  assets: {N}")
+
+    print("  building 15m timing features...")
+    feats_15m, valid_15m = _build_15m_timing(px_15m)
+    print(f"  15m: {len(feats_15m)} features, {len(valid_15m)} valid bars")
+
+    print("  building 1h hierarchical features...")
+    feats_1h, valid_1h = _build_1h_hierarchical(px_15m)
+    print(f"  1h: {len(feats_1h)} features, {len(valid_1h)} valid bars")
+
+    print("  building 4h hierarchical + cross-sectional features...")
+    feats_4h, ret_4h, shr_4h, dd_4h, valid_4h = _build_4h_features(px_15m)
+    print(f"  4h: {len(feats_4h)} features, {len(valid_4h)} valid bars")
+
+    idx_1h = valid_15m[3::4]
+    valid_1h = valid_1h.intersection(idx_1h)
+    idx_4h = valid_15m[15::16]
+    valid_4h_aligned = valid_4h.intersection(idx_4h)
+    if len(valid_4h_aligned) < len(valid_4h):
+        print(f"  4h alignment: {len(valid_4h)} -> {len(valid_4h_aligned)}")
+        valid_4h = valid_4h_aligned
+
     t0 = valid_4h[0]
     t1 = valid_4h[-1]
     valid_15m = valid_15m[(valid_15m >= t0) & (valid_15m <= t1)]
-    valid_1h_sub = valid_1h_sub[(valid_1h_sub >= t0) & (valid_1h_sub <= t1)]
-    print(f"  after 4h alignment: 15m={len(valid_15m)} 1h_sub={len(valid_1h_sub)}")
-    hier_15m = compute_hierarchy_indices(valid_15m, valid_4h)
-    hier_1h_sub = compute_hierarchy_indices(valid_1h_sub, valid_4h)
+    valid_1h = valid_1h[(valid_1h >= t0) & (valid_1h <= t1)]
+    print(f"  after alignment: 15m={len(valid_15m)} 1h={len(valid_1h)} 4h={len(valid_4h)}")
+
     end_15m = np.searchsorted(valid_15m.asi8, valid_4h.asi8, side = "right")
     start_15m = np.maximum(end_15m - 96, 0)
-    end_1h = np.searchsorted(valid_1h_sub.asi8, valid_4h.asi8, side = "right")
+    end_1h = np.searchsorted(valid_1h.asi8, valid_4h.asi8, side = "right")
     start_1h = np.maximum(end_1h - 48, 0)
     window_idx_15m = np.stack([start_15m, end_15m], axis = 1).astype(np.int32)
     window_idx_1h = np.stack([start_1h, end_1h], axis = 1).astype(np.int32)
-    model1_output_placeholder = np.zeros((len(valid_4h), 6), dtype = np.float32)
-    sent_scores_4h, sent_missing_4h = sentiment_placeholder(len(valid_4h), N)
-    f4h_arr = stack_node_array(feats_4h, valid_4h)
-    print(f"  final 4h feature array: {f4h_arr.shape} ({f4h_arr.shape[2]} features per asset)")
+
+    m1_path = os.path.join(BASE_DIR, "model1_outputs.npz")
+    if os.path.exists(m1_path):
+        m1_data = np.load(m1_path)
+        if "model1_outputs_15m" in m1_data.files:
+            m1_outputs_15m = m1_data["model1_outputs_15m"]
+            m1_times_15m = m1_data["times_15m"]
+            m1_idx = np.searchsorted(m1_times_15m, valid_4h.asi8)
+            valid_mask = m1_idx < len(m1_times_15m)
+            model1_outputs = np.zeros((len(valid_4h), m1_outputs_15m.shape[1]), dtype = np.float32)
+            model1_outputs[valid_mask] = m1_outputs_15m[m1_idx[valid_mask]]
+            print(f"  loaded model1_outputs at 15m cadence: {model1_outputs.shape} (zero staleness)")
+        else:
+            m1_outputs_1h = m1_data["model1_outputs"] if "model1_outputs" in m1_data.files else m1_data["model1_outputs_1h"]
+            m1_times_1h = m1_data["times_1h"]
+            m1_idx = np.searchsorted(m1_times_1h, valid_4h.asi8)
+            valid_mask = m1_idx < len(m1_times_1h)
+            model1_outputs = np.zeros((len(valid_4h), m1_outputs_1h.shape[1]), dtype = np.float32)
+            model1_outputs[valid_mask] = m1_outputs_1h[m1_idx[valid_mask]]
+            print(f"  loaded model1_outputs at 1h cadence: {model1_outputs.shape} (up to 3h stale)")
+    else:
+        model1_outputs = np.zeros((len(valid_4h), 5), dtype = np.float32)
+        print(f"  WARNING: {m1_path} not found, using zeros")
+
+    sent_scores, sent_missing = sentiment_placeholder(len(valid_4h), N)
+
+    arr_4h = stack_node_array(feats_4h, valid_4h)
+    arr_1h = stack_node_array(feats_1h, valid_1h)
+    arr_15m = stack_node_array(feats_15m, valid_15m)
+
+    feature_names_4h = np.array(list(feats_4h.keys()), dtype = "U40")
+    feature_names_1h = np.array(list(feats_1h.keys()), dtype = "U40")
+    feature_names_15m = np.array(list(feats_15m.keys()), dtype = "U40")
+
+    print(f"  arrays: 15m={arr_15m.shape} 1h={arr_1h.shape} 4h={arr_4h.shape}")
+
     save_npz("model2_dataset",
-             features_15m = stack_node_array(feats_15m, valid_15m),
-             features_30m = stack_node_array(feats_1h, valid_1h_sub),
-             features_1h = f4h_arr,
+             features_15m = arr_15m,
+             features_1h = arr_1h,
+             features_4h = arr_4h,
              targets = np.stack([
                  ret_4h.loc[valid_4h].values,
                  shr_4h.loc[valid_4h].values,
                  dd_4h.loc[valid_4h].values,
              ], axis = 2).astype(np.float32),
              times_15m = valid_15m.asi8,
-             times_30m = valid_1h_sub.asi8,
-             times_1h = valid_4h.asi8,
+             times_1h = valid_1h.asi8,
+             times_4h = valid_4h.asi8,
              time_enc_15m = compute_time_encoding(valid_15m.asi8, "15m"),
-             time_enc_30m = compute_time_encoding(valid_1h_sub.asi8, "1h"),
-             time_enc_1h = compute_time_encoding(valid_4h.asi8, "4h"),
-             hierarchy_15m_to_1h = hier_15m,
-             hierarchy_30m_to_1h = hier_1h_sub,
+             time_enc_1h = compute_time_encoding(valid_1h.asi8, "1h"),
+             time_enc_4h = compute_time_encoding(valid_4h.asi8, "4h"),
              window_idx_15m = window_idx_15m,
-             window_idx_30m = window_idx_1h,
-             model1_outputs = model1_output_placeholder,
-             sentiment_scores = sent_scores_4h,
-             sentiment_missing = sent_missing_4h)
+             window_idx_1h = window_idx_1h,
+             model1_outputs = model1_outputs,
+             sentiment_scores = sent_scores,
+             sentiment_missing = sent_missing,
+             feature_names_4h = feature_names_4h,
+             feature_names_1h = feature_names_1h,
+             feature_names_15m = feature_names_15m)

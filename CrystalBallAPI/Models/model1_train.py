@@ -1,656 +1,296 @@
 import os
 import sys
+import json
 import time
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score, classification_report, accuracy_score
+import xgboost as xgb
+from xgboost import XGBRegressor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model1_layers import (
-    LearnableGraphEncoder, TemporalAssetEncoder, SentimentEncoder,
-    GRN, SupConRegularizer, EMAModel,
-)
-from ds_struc_wstg import Model1Dataset, BASE_DIR
+from ds_struc_wstg import BASE_DIR
 
-# Default configuration for Model1. This can be overridden by passing a dict to the Model1 constructor or the train function.
-#all strides must be odd
 DEFAULT_CFG = {
-    "N": 20,
-    "F_node": 104,
-    "F_global": 8,
-    "D_time": 9,
-    "F_sentiment": 5,
-    "use_sentiment": False,
-    "window": 672,
-    "n_regime_classes": 3,
-    "n_horizons": 4,
-    "F_edge": 1,
-    "d_model": 64,
-    "d_lstm": 128,
-    "d_embed": 96,
-    "n_heads": 4,
-    "n_graph_layers": 2,
-    "n_lstm_layers": 1,
-    "graph_window": 64,
-    "F_btc_raw": 3,
-    "d_btc": 32,
-    "d_sentiment": 24,
-    "pool_stride": 4,
-    "dropout": 0.20,
-    "btc_drop": 0.20,
-    "stoch_depth": 0.15,
-    "label_smoothing": 0.08,
-    "lambda_transition": 0.10,
-    "lambda_aux": 0.15,
-    "lambda_supcon": 0.05,
-    "lr": 1.5e-4,
-    "transition_lr_scale": 1.0,
-    "weight_decay": 2e-3,
-    "batch_size": 64,
-    "grad_accum_steps": 1,
-    "epochs": 200,
-    "grad_clip": 1.0,
-    "warmup_epochs": 10,
-    "warmup_start_factor": 0.1,
-    "train_stride": 3,
-    "scheduler_eta_min": 5e-5,
-    "patience": 35,
-    "use_amp": True,
-    "mixup_alpha": 0.0,
-    "ema_decay": 0.999,
-    "ema_eval_after": 10,
-    "transition_pos_weight_cap": 4.0,
-    "temporal_mask_prob": 0.15,
-    "temporal_block_size": 8,
-    "feature_mask_prob": 0.10,
-    "feature_noise_std": 0.03,
+    "n_estimators": 1500,
+    "max_depth": 8,
+    "learning_rate": 0.05,
+    "subsample": 0.80,
+    "colsample_bytree": 0.80,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "min_child_weight": 25,
+    "early_stopping_rounds": 50,
+    "train_frac": 0.70,
+    "val_frac": 0.15,
 }
 
-# Model1 is a multi-input architecture that processes temporal asset features, learnable graph representations, and optional sentiment scores to predict market regimes and transitions. 
-# It uses gated fusion to combine temporal and graph information, and has auxiliary heads for trending and ADX predictions. The training loop includes data augmentation, mixed precision, 
-# learning rate scheduling, and early stopping based on validation F1 score.
-class Model1(nn.Module):
+REGIME_NAMES = ["bull", "bear", "accumulating", "distributing"]
 
-    def __init__(self, cfg = None):
-        super().__init__()
-        cfg = {**DEFAULT_CFG, **(cfg or {})}
 
-        F_node = cfg["F_node"]
-        F_global = cfg["F_global"]
-        D_time = cfg["D_time"]
-        N = cfg["N"]
-        F_sentiment = cfg["F_sentiment"]
-        d_model = cfg["d_model"]
-        d_lstm = cfg["d_lstm"]
-        d_embed = cfg["d_embed"]
-        n_heads = cfg["n_heads"]
-        n_graph_layers = cfg["n_graph_layers"]
-        n_lstm_layers = cfg["n_lstm_layers"]
-        d_sentiment = cfg["d_sentiment"]
-        dropout = cfg["dropout"]
-        n_cls = cfg["n_regime_classes"]
-        F_btc_raw = cfg.get("F_btc_raw", 4)
-        d_btc = cfg.get("d_btc", 32)
-        n_horizons = cfg.get("n_horizons", 4)
-        F_edge = cfg.get("F_edge", 1)
+def load_features(npz_path):
+    d = np.load(npz_path, allow_pickle = True)
+    market = np.array(d["market_features"], dtype = np.float32)
+    glob = np.array(d["global_features"], dtype = np.float32)
+    btc = np.array(d["btc_raw"], dtype = np.float32)
+    X = np.concatenate([market, glob, btc], axis = 1)
+    regime_labels = np.array(d["regime_labels"], dtype = np.int64)
+    regime_scores = np.array(d["regime_scores"], dtype = np.float32)
+    times = np.array(d["times"])
+    feature_names = [str(s) for s in d["feature_names"]] if "feature_names" in d.files else None
+    return X, regime_labels, regime_scores, times, feature_names
 
-        self.graph_window = cfg["graph_window"]
-        self.F_btc_raw = F_btc_raw
-        self.use_sentiment = cfg.get("use_sentiment", False)
-        self.d_sentiment = d_sentiment
 
-        self.graph_encoder = LearnableGraphEncoder(
-            F_node, d_embed, N,
-            n_horizons = n_horizons, F_edge = F_edge,
-            n_heads = n_heads, n_layers = n_graph_layers,
-            dropout = dropout, stoch_depth = cfg.get("stoch_depth", 0.1))
+def make_soft_targets(regime_scores):
+    y_dir = (regime_scores[:, 1] + regime_scores[:, 3]).astype(np.float32)
+    y_phase = (regime_scores[:, 2] + regime_scores[:, 3]).astype(np.float32)
+    return y_dir, y_phase
 
-        self.temporal_encoder = TemporalAssetEncoder(
-            F_node, F_global, D_time,
-            d_model = d_model, d_lstm = d_lstm,
-            n_lstm_layers = n_lstm_layers,
-            pool_stride = cfg.get("pool_stride", 4),
-            dropout = dropout)
 
-        self.sentiment_encoder = SentimentEncoder(
-            N, F_sentiment, d_sentiment, dropout = dropout)
-
-        self.asset_embed = nn.Embedding(N, d_embed)
-        nn.init.normal_(self.asset_embed.weight, std = 0.02)
-        self.asset_proj_temporal = (
-            nn.Linear(d_embed, d_model, bias = False) if d_embed != d_model
-            else None)
-
-        d_graph = d_embed * 2
-        self.temporal_gate = GRN(d_lstm, d_lstm, d_ctx = d_graph, dropout = dropout)
-        self.graph_gate = GRN(d_graph, d_graph, d_ctx = d_lstm, dropout = dropout)
-
-        d_ctx = d_lstm + d_graph + d_sentiment + 1
-
-        self.btc_proj = nn.Linear(F_btc_raw, d_btc)
-        self.btc_drop = nn.Dropout(cfg.get("btc_drop", 0.20))
-        self.btc_regime_head = nn.Linear(d_btc, n_cls)
-
-        d_fused = d_ctx + d_btc
-        self.regime_head = nn.Sequential(
-            nn.Linear(d_fused, d_fused // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_fused // 2, n_cls),
-        )
-
-        self.trending_head = nn.Linear(d_ctx, 1)
-        self.adx_head = nn.Linear(d_ctx, 1)
-
-        self.d_combined = d_fused
-
-        self.transition_head = nn.Sequential(
-            nn.Linear(d_fused, d_fused // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_fused // 2, 1),
-        )
-
-        self.supcon = None
-        if cfg.get("lambda_supcon", 0) > 0:
-            self.supcon = SupConRegularizer(d_fused, d_proj = 64, temperature = 0.1)
-
-        self.cfg = cfg
-
-    def _asset_emb(self):
-        a = self.asset_embed.weight
-        if self.asset_proj_temporal is not None:
-            return a, self.asset_proj_temporal(a)
-        return a, a
-
-    def encode(self, batch):
-        node_features = batch["node_features"]
-        global_features = batch["global_features"]
-        time_enc = batch["time_enc"]
-        sentiment_scores = batch["sentiment_scores"]
-        sentiment_missing = batch["sentiment_missing"]
-
-        a_graph, a_temporal = self._asset_emb()
-
-        temporal_vec = self.temporal_encoder(
-            node_features, global_features, time_enc, asset_embed = a_temporal)
-
-        gw = self.graph_window
-        node_feats_graph = node_features[:, -gw :, :, :]
-        node_emb = self.graph_encoder(node_feats_graph, asset_embed = a_graph)
-        graph_mean = node_emb.mean(dim = 1)
-        graph_max = node_emb.max(dim = 1).values
-        graph_vec = torch.cat([graph_mean, graph_max], dim = -1)
-
-        temporal_fused = self.temporal_gate(temporal_vec, ctx = graph_vec)
-        graph_fused = self.graph_gate(graph_vec, ctx = temporal_vec)
-
-        if self.use_sentiment:
-            sent_vec = self.sentiment_encoder(sentiment_scores, sentiment_missing)
-        else:
-            B = temporal_fused.shape[0]
-            sent_vec = torch.zeros(B, self.d_sentiment + 1, device = temporal_fused.device,
-                                   dtype = temporal_fused.dtype)
-
-        ctx_vec = torch.cat([temporal_fused, graph_fused, sent_vec], dim = -1)
-
-        btc_raw = batch["btc_raw"]
-        if self.training:
-            btc_raw = self.btc_drop(btc_raw)
-        btc_hidden = F.gelu(self.btc_proj(btc_raw))
-
-        return ctx_vec, btc_hidden
-
-    def forward(self, batch):
-        ctx_vec, btc_hidden = self.encode(batch)
-
-        btc_logits = self.btc_regime_head(btc_hidden)
-        fused = torch.cat([ctx_vec, btc_hidden], dim = -1)
-        ctx_logits = self.regime_head(fused)
-        regime_logits = btc_logits + ctx_logits
-
-        transition_logit = self.transition_head(fused).squeeze(-1)
-
-        aux = {
-            "trending_logit": self.trending_head(ctx_vec).squeeze(-1),
-            "adx_pred": self.adx_head(ctx_vec).squeeze(-1),
-        }
-
-        return regime_logits, transition_logit, fused, aux
-
-# Model1Loss combines cross-entropy loss for regime classification, binary cross-entropy for transition prediction, and optional auxiliary losses for trending and ADX predictions. 
-# It also incorporates KL divergence regularization between predicted regime scores and provided regime scores, weighted by a configurable factor.
-class Model1Loss(nn.Module):
-
-    def __init__(self, class_weights, transition_pos_weight,
-                 lambda_transition = 0.10, lambda_aux = 0.15,
-                 label_smoothing = 0.08, kl_weight = 0.20):
-        super().__init__()
-        self.ce_loss = nn.CrossEntropyLoss(weight = class_weights, label_smoothing = label_smoothing)
-        self.transition_loss = nn.BCEWithLogitsLoss(pos_weight = transition_pos_weight)
-        self.trending_loss = nn.BCEWithLogitsLoss()
-        self.aux_reg = nn.SmoothL1Loss()
-        self.lambda_transition = lambda_transition
-        self.lambda_aux = lambda_aux
-        self.kl_weight = kl_weight
-
-    def forward(self, regime_logits, transition_logit, regime_labels, regime_scores,
-                transition_labels, aux = None, adx_target = None):
-        ce = self.ce_loss(regime_logits, regime_labels)
-        log_pred = F.log_softmax(regime_logits, dim = -1)
-        kl = F.kl_div(log_pred, regime_scores, reduction = "batchmean")
-        r_loss = (1.0 - self.kl_weight) * ce + self.kl_weight * kl
-        t_loss = self.transition_loss(transition_logit, transition_labels)
-        total = r_loss + self.lambda_transition * t_loss
-        if aux is not None:
-            trending_target = (regime_labels < 2).float()
-            total = total + self.lambda_aux * self.trending_loss(
-                aux["trending_logit"], trending_target)
-            if adx_target is not None:
-                total = total + self.lambda_aux * self.aux_reg(
-                    aux["adx_pred"], adx_target)
-        return total, r_loss.detach(), t_loss.detach()
-
-# compute_class_weights calculates inverse frequency weights for each class in the dataset to address class imbalance. It can use either regime_scores or regime_labels from the dataset to determine class frequencies
-def compute_class_weights(dataset, n_classes = 3, power = 1.0):
-    if hasattr(dataset, "regime_scores"):
-        labels = dataset.regime_scores.argmax(axis = 1).astype(np.int64)
-    else:
-        labels = dataset.regime_labels.astype(np.int64)
-    counts = np.bincount(labels, minlength = n_classes).astype(np.float32)
-    counts = np.maximum(counts, 1.0)
-    inv_freq = counts.sum() / (n_classes * counts)
-    raw = np.power(inv_freq, power)
-    weights = raw / raw.sum() * n_classes
-    return torch.from_numpy(weights)
-
-# compute_transition_pos_weight calculates the positive class weight for the transition prediction loss based on the ratio of negative to positive samples in the dataset. It caps the weight at a specified maximum to prevent excessively large values.
-def compute_transition_pos_weight(dataset, cap = 4.0):
-    labels = dataset.transition_labels
-    n_pos = float((labels == 1).sum())
-    n_neg = float((labels == 0).sum())
-    pos_weight = min(n_neg / max(n_pos, 1.0), cap)
-    return torch.tensor([pos_weight])
-
-# augment_batch applies data augmentation techniques to the input batch during training. It can perform temporal masking by randomly zeroing out 
-# contiguous blocks of time steps, feature masking by randomly zeroing out individual features, and adding Gaussian noise to the features. The probabilities and parameters 
-# for these augmentations are configurable through the cfg dictionary.
-def augment_batch(batch, cfg):
-    node = batch["node_features"]
-    glob = batch["global_features"]
-    tenc = batch["time_enc"]
-    B, T = node.shape[:2]
-    device = node.device
-
-    mask_prob = cfg.get("temporal_mask_prob", 0.0)
-    block_size = cfg.get("temporal_block_size", 8)
-    if mask_prob > 0:
-        protect_tail = 2
-        maskable_T = T - protect_tail
-        n_blocks = (maskable_T + block_size - 1) // block_size
-        block_keep = torch.bernoulli(
-            torch.full((B, n_blocks), 1.0 - mask_prob, device = device))
-        time_mask = block_keep.repeat_interleave(block_size, dim = 1)[:, :maskable_T]
-        time_mask = torch.cat(
-            [time_mask, torch.ones(B, protect_tail, device = device)], dim = 1)
-        node = node * time_mask[:, :, None, None]
-        glob = glob * time_mask[:, :, None]
-        tenc = tenc * time_mask[:, :, None]
-
-    feat_mask_prob = cfg.get("feature_mask_prob", 0.0)
-    if feat_mask_prob > 0:
-        F_node = node.shape[-1]
-        F_glob = glob.shape[-1]
-        node_fmask = torch.bernoulli(
-            torch.full((B, 1, 1, F_node), 1.0 - feat_mask_prob, device = device))
-        glob_fmask = torch.bernoulli(
-            torch.full((B, 1, F_glob), 1.0 - feat_mask_prob, device = device))
-        node = node * node_fmask
-        glob = glob * glob_fmask
-
-    noise_std = cfg.get("feature_noise_std", 0.0)
-    if noise_std > 0:
-        node = node + torch.randn_like(node) * noise_std
-        glob = glob + torch.randn_like(glob) * noise_std
-
-    batch["node_features"] = node
-    batch["global_features"] = glob
-    batch["time_enc"] = tenc
-    return batch
-
-#_ to_device moves all tensors in the batch dictionary to the specified device (CPU or GPU) with non-blocking transfers for improved performance during training and evaluation.
-def _to_device(batch, device):
-    return {k: v.to(device, non_blocking = True) for k, v in batch.items()}
-
-# _compute_metrics calculates evaluation metrics for the regime classification and transition prediction tasks. It computes overall accuracy, macro F1 score 
-# for regime classification, F1 score per class, and recall for transition prediction based on a binary threshold of 0.5.
-def _compute_metrics(regime_pred, regime_true, trans_pred, trans_true, n_classes = 3):
-    acc = float((regime_pred == regime_true).mean())
-
-    f1_per_class = []
-    for c in range(n_classes):
-        tp = ((regime_pred == c) & (regime_true == c)).sum()
-        fp = ((regime_pred == c) & (regime_true != c)).sum()
-        fn = ((regime_pred != c) & (regime_true == c)).sum()
-        prec = tp / (tp + fp + 1e-9)
-        rec = tp / (tp + fn + 1e-9)
-        f1_per_class.append(2 * prec * rec / (prec + rec + 1e-9))
-    f1_macro = float(np.mean(f1_per_class))
-
-    trans_binary = (trans_pred >= 0.5).astype(np.int32)
-    tp_t = ((trans_binary == 1) & (trans_true == 1)).sum()
-    fn_t = ((trans_binary == 0) & (trans_true == 1)).sum()
-    trans_recall = float(tp_t / (tp_t + fn_t + 1e-9))
-
+def chronological_split(X, y_dir, y_phase, regime_labels, train_frac = 0.70, val_frac = 0.15):
+    n = len(X)
+    n_tr = int(n * train_frac)
+    n_va = int(n * (train_frac + val_frac))
     return {
-        "acc": acc,
-        "f1_macro": f1_macro,
-        "f1_per_class": [float(x) for x in f1_per_class],
-        "trans_recall": trans_recall,
+        "X_tr": X[:n_tr], "X_val": X[n_tr:n_va], "X_te": X[n_va:],
+        "dir_tr": y_dir[:n_tr], "dir_val": y_dir[n_tr:n_va], "dir_te": y_dir[n_va:],
+        "phase_tr": y_phase[:n_tr], "phase_val": y_phase[n_tr:n_va], "phase_te": y_phase[n_va:],
+        "regime_tr": regime_labels[:n_tr], "regime_val": regime_labels[n_tr:n_va], "regime_te": regime_labels[n_va:],
     }
 
-# train_epoch performs one epoch of training for the Model1 architecture. It iterates over the training data loader, applies data augmentation, 
-# computes the loss using the Model1Loss function, and updates the model parameters using backpropagation and an optimizer. It also supports mixed
-# precision training with a GradScaler and can update an exponential moving average (EMA) of the model parameters if provided. The function returns the average loss 
-# for the epoch as well as separate losses for regime classification and transition prediction.
-def train_epoch(model, loader, optimizer, loss_fn, scaler, device, grad_clip,
-                cfg = None, ema = None):
-    model.train()
-    total_loss = total_r = total_t = 0.0
-    n = 0
-    lambda_supcon = cfg.get("lambda_supcon", 0.0) if cfg else 0.0
-    grad_accum = cfg.get("grad_accum_steps", 1) if cfg else 1
 
-    optimizer.zero_grad(set_to_none = True)
+def reconstruct_4class(dir_prob, phase_prob):
+    probs = np.stack([
+        (1 - dir_prob) * (1 - phase_prob),
+        dir_prob * (1 - phase_prob),
+        (1 - dir_prob) * phase_prob,
+        dir_prob * phase_prob,
+    ], axis = -1)
+    return probs
 
-    for step, batch in enumerate(loader):
-        batch = _to_device(batch, device)
-        regime_scores = batch.pop("regime_score")
-        regime_labels = batch.pop("regime_label")
-        transition_labels = batch.pop("transition_label")
-        adx_target = batch["btc_raw"][:, 2]
 
-        batch = augment_batch(batch, cfg)
+def evaluate(dir_model, phase_model, X, regime_labels, split_name = "test"):
+    dir_prob = dir_model.predict(X).clip(0.0, 1.0)
+    phase_prob = phase_model.predict(X).clip(0.0, 1.0)
+    probs_4c = reconstruct_4class(dir_prob, phase_prob)
+    pred_4c = probs_4c.argmax(axis = -1)
+    acc = accuracy_score(regime_labels, pred_4c)
+    f1_macro = f1_score(regime_labels, pred_4c, average = "macro", zero_division = 0)
+    f1_per = f1_score(regime_labels, pred_4c, average = None, labels = [0, 1, 2, 3], zero_division = 0)
+    dir_true = ((regime_labels == 1) | (regime_labels == 3)).astype(int)
+    phase_true = (regime_labels >= 2).astype(int)
+    dir_acc = accuracy_score(dir_true, (dir_prob > 0.5).astype(int))
+    phase_acc = accuracy_score(phase_true, (phase_prob > 0.5).astype(int))
+    print(f"\n  {split_name} results:")
+    print(f"    4-class acc={acc:.4f}  f1_macro={f1_macro:.4f}")
+    print(f"    per-class: " + "  ".join(f"{REGIME_NAMES[i]}={f1_per[i]:.3f}" for i in range(4)))
+    print(f"    direction acc={dir_acc:.4f}  phase acc={phase_acc:.4f}")
+    print(f"\n{classification_report(regime_labels, pred_4c, target_names = REGIME_NAMES, zero_division = 0)}")
+    return {"acc": acc, "f1_macro": f1_macro, "f1_per_class": f1_per.tolist(),
+            "dir_acc": dir_acc, "phase_acc": phase_acc}
 
-        with torch.amp.autocast(device_type = device.type, enabled = scaler is not None):
-            regime_logits, transition_logit, combined, aux = model(batch)
-            loss, r_loss, t_loss = loss_fn(
-                regime_logits, transition_logit, regime_labels, regime_scores, transition_labels,
-                aux = aux, adx_target = adx_target)
 
-            if lambda_supcon > 0 and model.supcon is not None:
-                loss = loss + lambda_supcon * model.supcon(combined, regime_labels)
+def print_feature_importance(model, feature_names, name, top_k = 20):
+    imp = model.feature_importances_
+    ranked = np.argsort(imp)[::-1][:top_k]
+    print(f"\n  {name} top-{top_k} features (gain):")
+    for i, idx in enumerate(ranked):
+        fname = feature_names[idx] if feature_names else f"f{idx}"
+        print(f"    {i + 1:>2}. {fname:<35} {imp[idx]:.4f}")
 
-            loss = loss / grad_accum
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+def calibration_analysis(dir_model, phase_model, X, regime_labels, split_name = "val"):
+    dir_pred = dir_model.predict(X).clip(0.0, 1.0)
+    phase_pred = phase_model.predict(X).clip(0.0, 1.0)
+    dir_true = ((regime_labels == 1) | (regime_labels == 3)).astype(int)
+    phase_true = (regime_labels >= 2).astype(int)
+    probs_4c = reconstruct_4class(dir_pred, phase_pred)
+    pred_4c = probs_4c.argmax(axis = -1)
+    confidence = probs_4c.max(axis = -1)
+    correct = (pred_4c == regime_labels).astype(int)
 
-        if (step + 1) % grad_accum == 0:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-            optimizer.zero_grad(set_to_none = True)
-            if ema is not None:
-                ema.update(model)
+    print(f"\n{'=' * 60}")
+    print(f"CALIBRATION ANALYSIS ({split_name})")
+    print(f"{'=' * 60}")
 
-        bs = regime_labels.size(0)
-        total_loss += loss.item() * grad_accum * bs
-        total_r += r_loss.item() * bs
-        total_t += t_loss.item() * bs
-        n += bs
+    edges = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
+    print(f"\n  4-class confidence vs accuracy:")
+    print(f"  {'confidence':<15} {'count':>8} {'accuracy':>10} {'pct_of_data':>12}")
+    print(f"  {'-' * 48}")
+    for i in range(len(edges) - 1):
+        mask = (confidence >= edges[i]) & (confidence < edges[i + 1])
+        n = mask.sum()
+        if n == 0:
+            continue
+        acc = correct[mask].mean()
+        pct = n / len(confidence) * 100
+        label = f"{edges[i]:.1f}-{edges[i + 1]:.1f}"
+        tag = " *** OVERCONFIDENT" if acc < edges[i] else ""
+        print(f"  {label:<15} {n:>8} {acc:>10.3f} {pct:>11.1f}%{tag}")
 
-    return total_loss / n, total_r / n, total_t / n
+    for name, pred, true in [("Direction", dir_pred, dir_true), ("Phase", phase_pred, phase_true)]:
+        print(f"\n  {name} calibration (pred vs actual):")
+        print(f"  {'pred_range':<15} {'count':>8} {'pred_mean':>10} {'actual_mean':>12} {'gap':>8}")
+        print(f"  {'-' * 56}")
+        for i in range(10):
+            lo, hi = i * 0.1, (i + 1) * 0.1
+            mask = (pred >= lo) & (pred < hi)
+            n = mask.sum()
+            if n < 10:
+                continue
+            pm = pred[mask].mean()
+            am = true[mask].mean()
+            gap = pm - am
+            tag = " ***" if abs(gap) > 0.15 else ""
+            print(f"  {lo:.1f}-{hi:.1f}        {n:>8} {pm:>10.3f} {am:>12.3f} {gap:>+8.3f}{tag}")
 
-# eval_epoch evaluates the model on a validation or test dataset. It iterates over the data loader without computing gradients, collects predictions and true labels, 
-# and computes the average loss and evaluation metrics such as accuracy and F1 score for regime classification, as well as recall for transition prediction.
-@torch.no_grad()
-def eval_epoch(model, loader, loss_fn, device):
-    model.eval()
-    total_loss = total_r = total_t = 0.0
-    n = 0
-    all_regime_pred, all_regime_true = [], []
-    all_trans_pred, all_trans_true = [], []
+    wrong = ~correct.astype(bool)
+    print(f"\n  When WRONG (n={wrong.sum()}):")
+    print(f"    mean confidence: {confidence[wrong].mean():.3f}")
+    print(f"    median confidence: {np.median(confidence[wrong]):.3f}")
+    print(f"  When RIGHT (n={correct.sum()}):")
+    print(f"    mean confidence: {confidence[correct.astype(bool)].mean():.3f}")
+    print(f"    median confidence: {np.median(confidence[correct.astype(bool)]):.3f}")
 
-    for batch in loader:
-        batch = _to_device(batch, device)
-        regime_scores = batch.pop("regime_score")
-        regime_labels = batch.pop("regime_label")
-        transition_labels = batch.pop("transition_label")
+    really_wrong = wrong & (confidence > 0.7)
+    print(f"\n  Confidently wrong (conf>0.7 AND wrong): {really_wrong.sum()} ({really_wrong.sum() / len(confidence) * 100:.1f}%)")
+    if really_wrong.sum() > 0:
+        for c in range(4):
+            mask_c = really_wrong & (regime_labels == c)
+            if mask_c.sum() > 0:
+                pred_dist = np.bincount(pred_4c[mask_c], minlength = 4)
+                print(f"    true={REGIME_NAMES[c]}: {mask_c.sum()} cases, predicted as {dict(zip(REGIME_NAMES, pred_dist))}")
 
-        regime_logits, transition_logit, _, _ = model(batch)
-        loss, r_loss, t_loss = loss_fn(
-            regime_logits, transition_logit, regime_labels, regime_scores, transition_labels)
 
-        bs = regime_labels.size(0)
-        total_loss += loss.item() * bs
-        total_r += r_loss.item() * bs
-        total_t += t_loss.item() * bs
-        n += bs
-
-        all_regime_pred.append(regime_logits.argmax(dim = -1).cpu().numpy())
-        all_regime_true.append(regime_labels.cpu().numpy())
-        all_trans_pred.append(torch.sigmoid(transition_logit).cpu().numpy())
-        all_trans_true.append(transition_labels.cpu().numpy())
-
-    metrics = _compute_metrics(
-        np.concatenate(all_regime_pred),
-        np.concatenate(all_regime_true),
-        np.concatenate(all_trans_pred),
-        np.concatenate(all_trans_true),
-    )
-    return total_loss / n, total_r / n, total_t / n, metrics
-
-# save_checkpoint saves the model state, optimizer state, scheduler state, current epoch, best validation loss, and optionally the 
-# EMA model state to a specified file path. This allows for resuming training or loading the best model for evaluation later.
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, ema = None):
-    state = {
-        "cfg": model.cfg,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": epoch,
-        "best_val_loss": best_val_loss,
-    }
-    if ema is not None:
-        state["ema"] = ema.state_dict()
-    torch.save(state, path)
-
-# load_checkpoint loads the model state, optimizer state, scheduler state, current epoch, best validation loss, and optionally the EMA model state from a 
-# specified file path. It returns the loaded model and the checkpoint dictionary for further use.
-def load_checkpoint(path, device = "cpu"):
-    ckpt = torch.load(path, map_location = device)
-    model = Model1(ckpt["cfg"]).to(device)
-    model.load_state_dict(ckpt["model"])
-    return model, ckpt
-
-# train is the main function that sets up the training environment for Model1. It loads the dataset, creates data loaders for training, validation, and testing, 
-# computes class weights for imbalanced loss, initializes the model and optimizer, and defines the learning rate scheduler. It then runs the training loop for a 
-# specified number of epochs, evaluating on the validation set after each epoch and saving checkpoints when performance improves.
 def train(cfg = None):
-    cfg = {**DEFAULT_CFG, **(cfg or {})}
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
+    if cfg is None:
+        cfg = dict(DEFAULT_CFG)
     npz_path = os.path.join(BASE_DIR, "model1_dataset.npz")
-    dataset = Model1Dataset(npz_path, window = cfg["window"])
-    print(f"Dataset: T={dataset.T}  F_node={dataset.F_node}  "
-          f"F_global={dataset.F_global}  samples={len(dataset)}")
+    print(f"Loading {npz_path}")
+    X, regime_labels, regime_scores, times, feature_names = load_features(npz_path)
+    y_dir, y_phase = make_soft_targets(regime_scores)
+    print(f"Features: {X.shape}  Labels: {regime_labels.shape}")
+    print(f"Direction target: mean={y_dir.mean():.3f}  std={y_dir.std():.3f}")
+    print(f"Phase target: mean={y_phase.mean():.3f}  std={y_phase.std():.3f}")
 
-    cfg["F_node"] = dataset.F_node
-    cfg["F_global"] = dataset.F_global
-    cfg["D_time"] = dataset.D_time
-    cfg["F_sentiment"] = dataset.F_sentiment
-    cfg["F_btc_raw"] = getattr(dataset, "F_btc_raw", 3)
+    nan_count = np.isnan(X).sum()
+    if nan_count > 0:
+        print(f"WARNING: {nan_count} NaN values in features, filling with 0")
+        X = np.nan_to_num(X, nan = 0.0)
 
-    train_sub, val_sub, test_sub = dataset.chronological_split(
-        train = 0.70, val = 0.15)
-    if cfg["train_stride"] > 1:
-        from torch.utils.data import Subset as _Subset
-        strided = list(range(0, len(train_sub), cfg["train_stride"]))
-        train_sub = _Subset(train_sub.dataset, [train_sub.indices[i] for i in strided])
-    print(f"Split: train={len(train_sub)}  val={len(val_sub)}  test={len(test_sub)}")
+    s = chronological_split(X, y_dir, y_phase, regime_labels, cfg["train_frac"], cfg["val_frac"])
+    print(f"Split: train={len(s['X_tr'])}  val={len(s['X_val'])}  test={len(s['X_te'])}")
 
-    num_workers = 0
-    train_loader = DataLoader(
-        train_sub, batch_size = cfg["batch_size"], shuffle = True,
-        num_workers = num_workers, pin_memory = device.type == "cuda", drop_last = True)
-    val_loader = DataLoader(
-        val_sub, batch_size = cfg["batch_size"] * 2, shuffle = False,
-        num_workers = num_workers, pin_memory = device.type == "cuda")
-    test_loader = DataLoader(
-        test_sub, batch_size = cfg["batch_size"] * 2, shuffle = False,
-        num_workers = num_workers, pin_memory = device.type == "cuda")
+    xgb_params = {
+        "n_estimators": cfg["n_estimators"],
+        "max_depth": cfg["max_depth"],
+        "learning_rate": cfg["learning_rate"],
+        "subsample": cfg["subsample"],
+        "colsample_bytree": cfg["colsample_bytree"],
+        "reg_alpha": cfg["reg_alpha"],
+        "reg_lambda": cfg["reg_lambda"],
+        "min_child_weight": cfg["min_child_weight"],
+        "early_stopping_rounds": cfg["early_stopping_rounds"],
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        "tree_method": "hist",
+        "n_jobs": -1,
+        "random_state": 42,
+    }
 
-    base_ds = dataset.dataset if hasattr(dataset, "dataset") else dataset
-    n_cls = cfg["n_regime_classes"]
-    class_weights = compute_class_weights(base_ds, n_classes = n_cls).to(device)
-    trans_pos_weight = compute_transition_pos_weight(
-        base_ds, cap = cfg["transition_pos_weight_cap"]).to(device)
-    if hasattr(base_ds, "regime_scores"):
-        labels = base_ds.regime_scores.argmax(axis = 1).astype(np.int64)
-    else:
-        labels = base_ds.regime_labels.astype(np.int64)
-    counts = np.bincount(labels, minlength = n_cls)
-    print(f"Class counts: {counts.tolist()}  weights: {[round(w, 3) for w in class_weights.tolist()]}")
-    n_pos = (base_ds.transition_labels == 1).sum()
-    print(f"Transition labels: {n_pos}/{len(base_ds.transition_labels)} positive  pos_weight={trans_pos_weight.item():.2f}")
+    print("\n" + "=" * 60)
+    print("Training DIRECTION regressor (bear-camp strength)")
+    print("=" * 60)
+    t0 = time.time()
+    dir_model = XGBRegressor(**xgb_params)
+    dir_model.fit(s["X_tr"], s["dir_tr"],
+                  eval_set = [(s["X_tr"], s["dir_tr"]), (s["X_val"], s["dir_val"])],
+                  verbose = 50)
+    dir_time = time.time() - t0
+    best_dir = getattr(dir_model, "best_iteration", cfg["n_estimators"])
+    print(f"  trained in {dir_time:.1f}s  best_iteration={best_dir}")
 
-    model = Model1(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {n_params:,}  ({n_params * 4 / 1e6:.1f} MB float32)")
+    print("\n" + "=" * 60)
+    print("Training PHASE regressor (disagreement strength)")
+    print("=" * 60)
+    t0 = time.time()
+    phase_model = XGBRegressor(**xgb_params)
+    phase_model.fit(s["X_tr"], s["phase_tr"],
+                    eval_set = [(s["X_tr"], s["phase_tr"]), (s["X_val"], s["phase_val"])],
+                    verbose = 50)
+    phase_time = time.time() - t0
+    best_phase = getattr(phase_model, "best_iteration", cfg["n_estimators"])
+    print(f"  trained in {phase_time:.1f}s  best_iteration={best_phase}")
 
-    loss_fn = Model1Loss(
-        class_weights,
-        trans_pos_weight,
-        lambda_transition = cfg["lambda_transition"],
-        lambda_aux = cfg.get("lambda_aux", 0.15),
-        label_smoothing = cfg["label_smoothing"])
+    print("\n" + "=" * 60)
+    print("EVALUATION")
+    print("=" * 60)
+    train_metrics = evaluate(dir_model, phase_model, s["X_tr"], s["regime_tr"], "train")
+    val_metrics = evaluate(dir_model, phase_model, s["X_val"], s["regime_val"], "val")
+    test_metrics = evaluate(dir_model, phase_model, s["X_te"], s["regime_te"], "test")
 
-    trans_ids = set(id(p) for p in model.transition_head.parameters())
-    supcon_ids = set(id(p) for p in model.supcon.parameters()) if model.supcon else set()
-    aux_head_params = list(model.trending_head.parameters()) + list(model.adx_head.parameters())
-    aux_ids = trans_ids | supcon_ids | set(id(p) for p in aux_head_params)
-    main_params = [p for p in model.parameters() if id(p) not in aux_ids and p.requires_grad]
-    trans_params = [p for p in model.transition_head.parameters() if p.requires_grad]
-    param_groups = [
-        {"params": main_params, "lr": cfg["lr"]},
-        {"params": trans_params, "lr": cfg["lr"] * cfg["transition_lr_scale"]},
-        {"params": aux_head_params, "lr": cfg["lr"]},
-    ]
-    if model.supcon is not None:
-        supcon_params = [p for p in model.supcon.parameters() if p.requires_grad]
-        param_groups.append({"params": supcon_params, "lr": cfg["lr"]})
+    if feature_names:
+        print_feature_importance(dir_model, feature_names, "Direction", top_k = 20)
+        print_feature_importance(phase_model, feature_names, "Phase", top_k = 20)
 
-    optimizer = torch.optim.AdamW(param_groups, weight_decay = cfg["weight_decay"])
-
-    cosine_T = cfg["epochs"] - cfg["warmup_epochs"]
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor = cfg["warmup_start_factor"],
-        end_factor = 1.0,
-        total_iters = cfg["warmup_epochs"])
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max = cosine_T,
-        eta_min = cfg["scheduler_eta_min"])
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers = [warmup, cosine],
-        milestones = [cfg["warmup_epochs"]])
-
-    print(f"Scheduler: warmup={cfg['warmup_epochs']}  cosine_T={cosine_T}  "
-          f"eta_min={cfg['scheduler_eta_min']}  total_epochs={cfg['epochs']}")
-
-    use_amp = cfg["use_amp"] and device.type == "cuda"
-    scaler = torch.amp.GradScaler() if use_amp else None
-
-    ema = EMAModel(model, decay = cfg["ema_decay"])
-    ema_eval_after = cfg.get("ema_eval_after", 10)
+    calibration_analysis(dir_model, phase_model, s["X_val"], s["regime_val"], "val")
+    calibration_analysis(dir_model, phase_model, s["X_te"], s["regime_te"], "test")
 
     ckpt_dir = os.path.join(BASE_DIR, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok = True)
-    best_path = os.path.join(ckpt_dir, "model1_best.pt")
-    last_path = os.path.join(ckpt_dir, "model1_last.pt")
+    dir_path = os.path.join(ckpt_dir, "model1_direction.json")
+    phase_path = os.path.join(ckpt_dir, "model1_phase.json")
+    dir_model.save_model(dir_path)
+    phase_model.save_model(phase_path)
+    print(f"\nSaved direction model: {dir_path}")
+    print(f"Saved phase model: {phase_path}")
 
-    best_val_f1 = 0.0
-    best_val_loss = float("inf")
-    patience_count = 0
+    meta = {"cfg": cfg, "train": train_metrics, "val": val_metrics, "test": test_metrics,
+            "dir_best_iter": int(getattr(dir_model, "best_iteration", cfg["n_estimators"])),
+            "phase_best_iter": int(getattr(phase_model, "best_iteration", cfg["n_estimators"]))}
+    meta_path = os.path.join(ckpt_dir, "model1_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent = 2)
+    print(f"Saved meta: {meta_path}")
 
-    for epoch in range(1, cfg["epochs"] + 1):
-        t0 = time.time()
+    return dir_model, phase_model, val_metrics
 
-        train_loss, train_r, train_t = train_epoch(
-            model, train_loader, optimizer, loss_fn, scaler, device,
-            cfg["grad_clip"], cfg = cfg, ema = ema)
 
-        use_ema_eval = epoch > ema_eval_after
-        if use_ema_eval:
-            ema.apply_shadow(model)
-        val_loss, val_r, val_t, val_metrics = eval_epoch(
-            model, val_loader, loss_fn, device)
-        if use_ema_eval:
-            ema.restore(model)
+def generate_model1_outputs(dir_model = None, phase_model = None):
+    npz_path = os.path.join(BASE_DIR, "model1_dataset.npz")
+    X, regime_labels, regime_scores, times, _ = load_features(npz_path)
+    nan_count = np.isnan(X).sum()
+    if nan_count > 0:
+        X = np.nan_to_num(X, nan = 0.0)
 
-        scheduler.step()
-        elapsed = time.time() - t0
+    if dir_model is None:
+        ckpt_dir = os.path.join(BASE_DIR, "checkpoints")
+        dir_model = XGBRegressor()
+        dir_model.load_model(os.path.join(ckpt_dir, "model1_direction.json"))
+        phase_model = XGBRegressor()
+        phase_model.load_model(os.path.join(ckpt_dir, "model1_phase.json"))
 
-        f1_str = "  ".join(f"C{i}={v:.3f}" for i, v in enumerate(val_metrics["f1_per_class"]))
-        ema_tag = " [ema]" if use_ema_eval else ""
-        print(
-            f"Ep {epoch:03d}  "
-            f"train {train_loss:.4f} (r={train_r:.4f} t={train_t:.4f})  "
-            f"val {val_loss:.4f} (r={val_r:.4f} t={val_t:.4f})  "
-            f"acc={val_metrics['acc']:.3f}  f1={val_metrics['f1_macro']:.3f}  "
-            f"t_rec={val_metrics['trans_recall']:.3f}  "
-            f"{f1_str}  "
-            f"{elapsed:.1f}s{ema_tag}"
-        )
+    dir_prob = dir_model.predict(X).clip(0.0, 1.0)
+    phase_prob = phase_model.predict(X).clip(0.0, 1.0)
+    dir_conf = np.abs(2.0 * dir_prob - 1.0)
+    phase_conf = np.abs(2.0 * phase_prob - 1.0)
+    transition_intensity = (1.0 - dir_conf) * (1.0 - phase_conf)
+    outputs_15m = np.stack([dir_prob, phase_prob, dir_conf, phase_conf, transition_intensity], axis = -1).astype(np.float32)
+    print(f"Generated model1_outputs: {outputs_15m.shape} at 15m cadence")
+    print(f"  channels: direction_prob, phase_prob, dir_confidence, phase_confidence, transition_intensity")
 
-        save_checkpoint(last_path, model, optimizer, scheduler, epoch, best_val_loss, ema = ema)
+    outputs_1h = outputs_15m[3::4]
+    times_1h = times[3::4]
+    print(f"Resampled to 1h: {outputs_1h.shape}")
 
-        val_f1 = val_metrics["f1_macro"]
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_val_loss = val_loss
-            patience_count = 0
-            save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_val_loss, ema = ema)
-            print(f"  => saved best  val_f1={best_val_f1:.4f}  val_loss={best_val_loss:.4f}")
-        else:
-            patience_count += 1
-            if patience_count >= cfg["patience"]:
-                print(f"Early stop at epoch {epoch} (patience={cfg['patience']})")
-                break
-
-    print("\nLoading best checkpoint for test evaluation...")
-    ckpt = torch.load(best_path, map_location = device)
-    model = Model1(ckpt["cfg"]).to(device)
-    model.load_state_dict(ckpt["model"])
-    if "ema" in ckpt:
-        best_ema = EMAModel(model)
-        best_ema.load_state_dict(ckpt["ema"])
-        best_ema.apply_shadow(model)
-
-    test_loss, test_r, test_t, test_metrics = eval_epoch(model, test_loader, loss_fn, device)
-    f1_str = "  ".join(f"C{i}={v:.3f}" for i, v in enumerate(test_metrics["f1_per_class"]))
-    print(
-        f"Test  loss={test_loss:.4f}  acc={test_metrics['acc']:.3f}  "
-        f"f1_macro={test_metrics['f1_macro']:.3f}  "
-        f"trans_recall={test_metrics['trans_recall']:.3f}  "
-        f"{f1_str}"
-    )
-
-    return model, test_metrics
+    return outputs_15m, times, outputs_1h, times_1h
 
 
 if __name__ == "__main__":
-    train()
+    dir_model, phase_model, _ = train()
+    outputs_15m, times_15m, outputs_1h, times_1h = generate_model1_outputs(dir_model, phase_model)
+
+    out_path = os.path.join(BASE_DIR, "model1_outputs.npz")
+    np.savez_compressed(out_path,
+                        model1_outputs_15m = outputs_15m, times_15m = times_15m,
+                        model1_outputs_1h = outputs_1h, times_1h = times_1h)
+    print(f"Saved {out_path}")
